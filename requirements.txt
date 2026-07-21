@@ -1,0 +1,13 @@
+pandas
+numpy
+scikit-learn
+lightgbm
+torch
+mlflow
+boto3
+anthropic
+streamlit
+jupyter
+matplotlib
+seaborn
+scipy
