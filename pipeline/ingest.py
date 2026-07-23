@@ -1,4 +1,4 @@
-"""Download and ingest the MovieLens 25M dataset."""
+"""Download and ingest the MovieLens latest (ml-latest) dataset."""
 
 import zipfile
 from pathlib import Path
@@ -6,12 +6,12 @@ from urllib.request import urlretrieve
 
 import pandas as pd
 
-DATASET_URL = "https://files.grouplens.org/datasets/movielens/ml-25m.zip"
+DATASET_URL = "https://files.grouplens.org/datasets/movielens/ml-latest.zip"
 
 DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 RAW_DIR = DATA_DIR / "raw"
-ZIP_PATH = DATA_DIR / "ml-25m.zip"
-EXTRACTED_DIR = RAW_DIR / "ml-25m"
+ZIP_PATH = DATA_DIR / "ml-latest.zip"
+EXTRACTED_DIR = RAW_DIR / "ml-latest"
 
 
 def download_dataset():
@@ -52,7 +52,7 @@ def write_summary(ratings, movies, tags):
     max_date = pd.to_datetime(ratings["timestamp"], unit="s").max()
 
     lines = [
-        "MovieLens 25M -- Summary Statistics",
+        "MovieLens latest -- Summary Statistics",
         "=" * 40,
         "",
         "ratings.csv",

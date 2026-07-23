@@ -1,17 +1,21 @@
-"""Clean and preprocess the raw MovieLens 25M dataset."""
+"""Clean and preprocess the raw MovieLens 'ml-latest' dataset."""
 
+import re
 from pathlib import Path
 
 import pandas as pd
 
 DATA_DIR = Path(__file__).resolve().parent.parent / "data"
-RAW_DIR = DATA_DIR / "raw" / "ml-25m"
+RAW_DIR = DATA_DIR / "raw" / "ml-latest"
 PROCESSED_DIR = DATA_DIR / "processed"
 
 MIN_RATINGS_PER_USER = 5
 MIN_RATINGS_PER_MOVIE = 5
 VALID_RATING_MIN = 0.5
 VALID_RATING_MAX = 5.0
+
+# "Matrix, The (1999)" -> "The Matrix (1999)"
+ARTICLE_SUFFIX_RE = re.compile(r"^(.*),\s+(The|A|An)\s+\((\d{4})\)\s*$")
 
 
 def load_raw():
@@ -24,29 +28,36 @@ def load_raw():
         RAW_DIR / "tags.csv",
         dtype={"userId": "int32", "movieId": "int32", "timestamp": "int64"},
     )
-    return ratings, movies, tags
+    links = pd.read_csv(RAW_DIR / "links.csv")
+    genome_scores = pd.read_csv(
+        RAW_DIR / "genome-scores.csv",
+        dtype={"movieId": "int32", "tagId": "int16", "relevance": "float32"},
+    )
+    genome_tags = pd.read_csv(RAW_DIR / "genome-tags.csv", dtype={"tagId": "int16"})
+    return ratings, movies, tags, links, genome_scores, genome_tags
 
 
-def report_missing(df, name):
+def report_missing_and_duplicates(df, name):
+    print(f"\n{name}: {len(df):,} rows")
     missing = df.isna().sum()
-    total = int(missing.sum())
-    print(f"  Missing values in {name}:")
-    if total == 0:
+    total_missing = int(missing.sum())
+    print("  Missing values:")
+    if total_missing == 0:
         print("    none")
     else:
         for col, count in missing[missing > 0].items():
             print(f"    {col}: {count:,}")
+    dup = int(df.duplicated().sum())
+    print(f"  Duplicate rows: {dup:,}")
+    return dup
 
 
-def report_quality(ratings, movies, tags):
+def report_quality(ratings, movies, tags, links, genome_scores, genome_tags):
     print("=" * 70)
     print("DATA QUALITY REPORT (before cleaning)")
     print("=" * 70)
 
-    print(f"\nratings.csv: {len(ratings):,} rows")
-    report_missing(ratings, "ratings")
-    dup_ratings = int(ratings.duplicated().sum())
-    print(f"  Duplicate rows: {dup_ratings:,}")
+    report_missing_and_duplicates(ratings, "ratings.csv")
     invalid_ratings = int(
         ((ratings["rating"] < VALID_RATING_MIN) | (ratings["rating"] > VALID_RATING_MAX)).sum()
     )
@@ -66,15 +77,31 @@ def report_quality(ratings, movies, tags):
         f"(of {ratings_per_movie.shape[0]:,} rated movies)"
     )
 
-    print(f"\nmovies.csv: {len(movies):,} rows")
-    report_missing(movies, "movies")
-    dup_movies = int(movies.duplicated().sum())
-    print(f"  Duplicate rows: {dup_movies:,}")
+    report_missing_and_duplicates(movies, "movies.csv")
+    n_needs_retitle = int(movies["title"].dropna().apply(lambda t: bool(ARTICLE_SUFFIX_RE.match(t.strip()))).sum())
+    print(f"  Titles in 'Article, The (year)' form needing reformat: {n_needs_retitle:,}")
 
-    print(f"\ntags.csv: {len(tags):,} rows")
-    report_missing(tags, "tags")
-    dup_tags = int(tags.duplicated().sum())
-    print(f"  Duplicate rows: {dup_tags:,}")
+    report_missing_and_duplicates(tags, "tags.csv")
+
+    report_missing_and_duplicates(links, "links.csv")
+    missing_tmdb = int(links["tmdbId"].isna().sum())
+    print(
+        f"  tmdbId missing: {missing_tmdb:,} ({missing_tmdb / len(links) * 100:.2f}%) "
+        f"-- will be flagged, not dropped"
+    )
+
+    report_missing_and_duplicates(genome_scores, "genome-scores.csv")
+    report_missing_and_duplicates(genome_tags, "genome-tags.csv")
+
+
+def fix_title_article(title):
+    if not isinstance(title, str):
+        return title
+    m = ARTICLE_SUFFIX_RE.match(title.strip())
+    if not m:
+        return title
+    base, article, year = m.groups()
+    return f"{article} {base.strip()} ({year})"
 
 
 def clean_ratings(ratings):
@@ -112,6 +139,12 @@ def clean_movies(movies):
     movies = movies.drop_duplicates().copy()
     stats["after_dedup"] = len(movies)
 
+    n_retitled = int(
+        movies["title"].dropna().apply(lambda t: bool(ARTICLE_SUFFIX_RE.match(t.strip()))).sum()
+    )
+    movies["title"] = movies["title"].apply(fix_title_article)
+    stats["titles_reformatted"] = n_retitled
+
     movies["genres_list"] = movies["genres"].apply(
         lambda g: [] if g == "(no genres listed)" else g.split("|")
     )
@@ -132,20 +165,36 @@ def clean_tags(tags):
     return tags, stats
 
 
-def explode_genres(movies_clean):
-    """One row per (movieId, genre) pair."""
-    genre_pairs = movies_clean[["movieId", "genres_list"]].explode("genres_list")
-    genre_pairs = genre_pairs.rename(columns={"genres_list": "genre"})
-    genre_pairs = genre_pairs[genre_pairs["genre"].notna() & (genre_pairs["genre"] != "")]
-    return genre_pairs.reset_index(drop=True)
+def clean_links(links):
+    stats = {"start": len(links)}
+
+    links = links.drop_duplicates().copy()
+    stats["after_dedup"] = len(links)
+
+    links["movieId"] = links["movieId"].astype("int32")
+    links["imdbId"] = links["imdbId"].astype("int32")
+    links["tmdb_id_missing"] = links["tmdbId"].isna()
+    stats["tmdb_missing_flagged"] = int(links["tmdb_id_missing"].sum())
+    links["tmdbId"] = links["tmdbId"].astype("Int64")  # nullable int -- keeps the NaNs, drops nothing
+
+    return links, stats
 
 
-def build_ratings_with_genres(ratings_clean, genre_pairs):
-    merged = ratings_clean.merge(genre_pairs, on="movieId", how="inner")
-    return merged[["userId", "movieId", "rating", "year", "month", "genre"]]
+def clean_genome_scores(genome_scores):
+    stats = {"start": len(genome_scores)}
+    genome_scores = genome_scores.drop_duplicates().copy()
+    stats["after_dedup"] = len(genome_scores)
+    return genome_scores, stats
 
 
-def print_before_after_report(ratings_stats, movies_stats, tags_stats, ratings_with_genres_len):
+def clean_genome_tags(genome_tags):
+    stats = {"start": len(genome_tags)}
+    genome_tags = genome_tags.drop_duplicates().copy()
+    stats["after_dedup"] = len(genome_tags)
+    return genome_tags, stats
+
+
+def print_before_after_report(ratings_stats, movies_stats, tags_stats, links_stats, genome_scores_stats, genome_tags_stats):
     print("\n" + "=" * 70)
     print("BEFORE / AFTER SUMMARY")
     print("=" * 70)
@@ -170,6 +219,7 @@ def print_before_after_report(ratings_stats, movies_stats, tags_stats, ratings_w
     print("\nmovies.csv")
     print(f"  Before: {m['start']:,} rows")
     print(f"  - duplicates dropped: {m['start'] - m['after_dedup']:,}")
+    print(f"  - titles reformatted ('Article, The (yr)' -> 'The Article (yr)'): {m['titles_reformatted']:,}")
     print(f"  After:  {m['after_dedup']:,} rows")
 
     t = tags_stats
@@ -178,17 +228,39 @@ def print_before_after_report(ratings_stats, movies_stats, tags_stats, ratings_w
     print(f"  - duplicates dropped: {t['start'] - t['after_dedup']:,}")
     print(f"  After:  {t['after_dedup']:,} rows")
 
-    print("\nratings_with_genres.csv")
-    print(f"  Rows (ratings_clean exploded across movie genres): {ratings_with_genres_len:,}")
+    l = links_stats
+    print("\nlinks.csv")
+    print(f"  Before: {l['start']:,} rows")
+    print(f"  - duplicates dropped: {l['start'] - l['after_dedup']:,}")
+    print(f"  - rows flagged with missing tmdbId (kept, not dropped): {l['tmdb_missing_flagged']:,}")
+    print(f"  After:  {l['after_dedup']:,} rows")
+
+    gs = genome_scores_stats
+    print("\ngenome-scores.csv")
+    print(f"  Before: {gs['start']:,} rows")
+    print(f"  - duplicates dropped: {gs['start'] - gs['after_dedup']:,}")
+    print(f"  After:  {gs['after_dedup']:,} rows")
+
+    gt = genome_tags_stats
+    print("\ngenome-tags.csv")
+    print(f"  Before: {gt['start']:,} rows")
+    print(f"  - duplicates dropped: {gt['start'] - gt['after_dedup']:,}")
+    print(f"  After:  {gt['after_dedup']:,} rows")
 
 
 def main():
     PROCESSED_DIR.mkdir(parents=True, exist_ok=True)
 
     print("Loading raw data from", RAW_DIR)
-    ratings, movies, tags = load_raw()
+    ratings, movies, tags, links, genome_scores, genome_tags = load_raw()
+    print(f"  ratings.csv:        {ratings.shape}")
+    print(f"  movies.csv:         {movies.shape}")
+    print(f"  tags.csv:           {tags.shape}")
+    print(f"  links.csv:          {links.shape}")
+    print(f"  genome-scores.csv:  {genome_scores.shape}")
+    print(f"  genome-tags.csv:    {genome_tags.shape}")
 
-    report_quality(ratings, movies, tags)
+    report_quality(ratings, movies, tags, links, genome_scores, genome_tags)
 
     print("\n" + "=" * 70)
     print("CLEANING")
@@ -197,10 +269,12 @@ def main():
     ratings_clean, ratings_stats = clean_ratings(ratings)
     movies_clean, movies_stats = clean_movies(movies)
     tags_clean, tags_stats = clean_tags(tags)
-    genre_pairs = explode_genres(movies_clean)
-    ratings_with_genres = build_ratings_with_genres(ratings_clean, genre_pairs)
+    links_clean, links_stats = clean_links(links)
+    genome_scores_clean, genome_scores_stats = clean_genome_scores(genome_scores)
+    genome_tags_clean, genome_tags_stats = clean_genome_tags(genome_tags)
 
     print("\nSaving cleaned files to", PROCESSED_DIR)
+
     ratings_clean.drop(columns=["date"]).to_csv(PROCESSED_DIR / "ratings_clean.csv", index=False)
     print(f"  Wrote ratings_clean.csv ({len(ratings_clean):,} rows)")
 
@@ -210,10 +284,18 @@ def main():
     tags_clean.drop(columns=["date"]).to_csv(PROCESSED_DIR / "tags_clean.csv", index=False)
     print(f"  Wrote tags_clean.csv ({len(tags_clean):,} rows)")
 
-    ratings_with_genres.to_csv(PROCESSED_DIR / "ratings_with_genres.csv", index=False)
-    print(f"  Wrote ratings_with_genres.csv ({len(ratings_with_genres):,} rows)")
+    links_clean.to_csv(PROCESSED_DIR / "links_clean.csv", index=False)
+    print(f"  Wrote links_clean.csv ({len(links_clean):,} rows)")
 
-    print_before_after_report(ratings_stats, movies_stats, tags_stats, len(ratings_with_genres))
+    genome_scores_clean.to_csv(PROCESSED_DIR / "genome_scores_clean.csv", index=False)
+    print(f"  Wrote genome_scores_clean.csv ({len(genome_scores_clean):,} rows)")
+
+    genome_tags_clean.to_csv(PROCESSED_DIR / "genome_tags_clean.csv", index=False)
+    print(f"  Wrote genome_tags_clean.csv ({len(genome_tags_clean):,} rows)")
+
+    print_before_after_report(
+        ratings_stats, movies_stats, tags_stats, links_stats, genome_scores_stats, genome_tags_stats
+    )
 
 
 if __name__ == "__main__":
