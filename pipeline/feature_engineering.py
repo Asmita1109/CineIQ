@@ -124,6 +124,84 @@ def build_genome_embeddings(n_components=GENOME_SVD_COMPONENTS):
 
 
 # ------------------------------------------------------------------
+# Forecasting features: lightweight standalone pass over ratings_clean.csv
+# that only accumulates genre x week counts (weekly, not monthly). Kept
+# separate from run_pass_one() since user/movie/rl features don't depend on
+# this and shouldn't be recomputed just to change the forecasting cadence.
+# ------------------------------------------------------------------
+def run_forecasting_pass(genre_pairs):
+    genre_week_partials = []
+    n_chunks = 0
+    n_rows = 0
+    for chunk in ratings_chunks():
+        n_chunks += 1
+        n_rows += len(chunk)
+        chunk = chunk[["movieId", "rating", "timestamp"]].copy()
+        chunk["week"] = pd.to_datetime(chunk["timestamp"], unit="s").dt.to_period("W")
+
+        chunk_genre = chunk.merge(genre_pairs, on="movieId", how="inner")
+        genre_week_partials.append(
+            chunk_genre.groupby(["genre", "week"])
+            .agg(count=("rating", "size"), sum=("rating", "sum"))
+            .reset_index()
+        )
+        print(f"  Forecasting pass - chunk {n_chunks}: {n_rows:,} rows processed so far")
+
+    genre_week_counts = (
+        pd.concat(genre_week_partials).groupby(["genre", "week"]).sum(numeric_only=True).reset_index()
+    )
+    return genre_week_counts
+
+
+def build_weekly_forecasting_features(genre_week_counts):
+    genre_week = genre_week_counts.rename(columns={"count": "rating_count", "sum": "rating_sum"})
+    genre_week["avg_rating"] = genre_week["rating_sum"] / genre_week["rating_count"]
+
+    all_weeks = pd.period_range(genre_week["week"].min(), genre_week["week"].max(), freq="W")
+    genres = sorted(genre_week["genre"].unique())
+    full_index = pd.MultiIndex.from_product([genres, all_weeks], names=["genre", "week"])
+
+    # reindex to the full genre x week grid so weeks with zero ratings for a
+    # genre show up as rating_count=0 instead of being silently skipped --
+    # otherwise lag_1/2/3 and the rolling averages would jump across gaps.
+    genre_week_full = (
+        genre_week.set_index(["genre", "week"])[["rating_count", "avg_rating"]]
+        .reindex(full_index)
+        .reset_index()
+    )
+    genre_week_full["rating_count"] = genre_week_full["rating_count"].fillna(0).astype("int32")
+    genre_week_full["week_start"] = genre_week_full["week"].dt.start_time.dt.date
+    genre_week_full = genre_week_full.sort_values(["genre", "week"]).reset_index(drop=True)
+
+    counts = genre_week_full.groupby("genre")["rating_count"]
+    genre_week_full["lag_1"] = counts.shift(1)
+    genre_week_full["lag_2"] = counts.shift(2)
+    genre_week_full["lag_3"] = counts.shift(3)
+    genre_week_full["rolling_3week_avg"] = counts.transform(
+        lambda s: s.rolling(window=3, min_periods=1).mean()
+    )
+    genre_week_full["rolling_6week_avg"] = counts.transform(
+        lambda s: s.rolling(window=6, min_periods=1).mean()
+    )
+    genre_week_full["is_synthetic"] = 0
+
+    return genre_week_full[
+        [
+            "genre",
+            "week_start",
+            "rating_count",
+            "avg_rating",
+            "lag_1",
+            "lag_2",
+            "lag_3",
+            "rolling_3week_avg",
+            "rolling_6week_avg",
+            "is_synthetic",
+        ]
+    ]
+
+
+# ------------------------------------------------------------------
 # Pass 1: stream ratings_clean.csv once, accumulate every aggregate
 # ------------------------------------------------------------------
 def run_pass_one(genre_pairs):
@@ -288,84 +366,101 @@ def run_pass_two(user_segment_lookup):
 def main():
     FEATURES_DIR.mkdir(parents=True, exist_ok=True)
 
-    forecasting_path = FEATURES_DIR / "forecasting_features.csv"
-    if forecasting_path.exists():
-        print(f"Skipping forecasting features -- {forecasting_path} already exists, left as-is.")
-    else:
-        print(f"Warning: {forecasting_path} not found. This run does not regenerate it.")
-
     movies, genre_pairs = load_movie_genres()
     print(f"movies_clean: {movies.shape}")
 
     print("\n" + "=" * 70)
-    print("GENOME EMBEDDINGS (chunked SVD compression, 1,128 -> 50 dims)")
+    print("1. FORECASTING FEATURES (weekly aggregation)")
     print("=" * 70)
-    genome_lookup, genome_cols = build_genome_embeddings()
-    show("genome_embeddings", genome_lookup)
-
-    print("\n" + "=" * 70)
-    print("PASS 1 - streaming aggregation (user/movie stats, favorite genre, recent history)")
-    print("=" * 70)
-    user_stats, movie_stats, user_genre_counts, recent_hist = run_pass_one(genre_pairs)
-
-    favorite_idx = user_genre_counts.groupby("userId")["count"].idxmax()
-    favorite_genre = user_genre_counts.loc[favorite_idx, ["userId", "genre"]].rename(
-        columns={"genre": "favorite_genre"}
+    genre_week_counts = run_forecasting_pass(genre_pairs)
+    forecasting_features = build_weekly_forecasting_features(genre_week_counts)
+    show("forecasting_features", forecasting_features)
+    forecasting_path = FEATURES_DIR / "forecasting_features.csv"
+    forecasting_features.to_csv(forecasting_path, index=False)
+    print(f"Saved -> {forecasting_path} (overwritten)")
+    print(
+        f"Date range: {forecasting_features['week_start'].min()} to "
+        f"{forecasting_features['week_start'].max()}"
     )
 
-    user_ids = list(recent_hist.keys())
-    recent_df = build_recent_movie_columns(user_ids, recent_hist)
-
-    print("\n" + "=" * 70)
-    print("2. USER FEATURES")
-    print("=" * 70)
-    user_features = finalize_user_stats(user_stats)
-    user_features["user_segment"] = user_features["total_ratings"].apply(segment_label).astype("category")
-    user_features = user_features.merge(favorite_genre, on="userId", how="left")
-    user_features = user_features.merge(recent_df, on="userId", how="left")
-    user_features = user_features[
-        [
-            "userId", "total_ratings", "avg_rating", "rating_std", "min_rating", "max_rating",
-            "favorite_genre", "user_segment",
-            "recent_movie_1", "recent_movie_2", "recent_movie_3", "recent_movie_4", "recent_movie_5",
-            "avg_reward",
-        ]
-    ]
-    show("user_features", user_features)
     user_features_path = FEATURES_DIR / "user_features.parquet"
-    user_features.to_parquet(user_features_path, index=False)
-    print(f"Saved -> {user_features_path}")
-
-    print("\nUser segment counts:")
-    print(user_features["user_segment"].value_counts())
-
-    print("\n" + "=" * 70)
-    print("3. MOVIE FEATURES")
-    print("=" * 70)
-    movie_features = finalize_movie_stats(movie_stats)
-    movie_features = movie_features.merge(movies[["movieId", "genres"]], on="movieId", how="left")
-    movie_features = movie_features.merge(genome_lookup, on="movieId", how="left")
-    movie_features[genome_cols] = movie_features[genome_cols].fillna(0.0)
-    movie_features = movie_features[["movieId", "total_ratings", "avg_rating", "rating_std", "genres"] + genome_cols]
-    show("movie_features", movie_features)
     movie_features_path = FEATURES_DIR / "movie_features.parquet"
-    movie_features.to_parquet(movie_features_path, index=False)
-    print(f"Saved -> {movie_features_path}")
-
-    print("\n" + "=" * 70)
-    print("PASS 2 - streaming rl_features.parquet to disk")
-    print("=" * 70)
-    user_segment_lookup = user_features[["userId", "user_segment"]]
-    rl_rows = run_pass_two(user_segment_lookup)
     rl_features_path = FEATURES_DIR / "rl_features.parquet"
-    print(f"Saved -> {rl_features_path} ({rl_rows:,} rows)")
+
+    if user_features_path.exists() and movie_features_path.exists() and rl_features_path.exists():
+        print(
+            "\nuser_features.parquet, movie_features.parquet, and rl_features.parquet already exist "
+            "-- skipping (they don't depend on the forecasting aggregation and are unaffected by this change)."
+        )
+        user_features = pd.read_parquet(user_features_path)
+        movie_features = pd.read_parquet(movie_features_path)
+    else:
+        print("\n" + "=" * 70)
+        print("GENOME EMBEDDINGS (chunked SVD compression, 1,128 -> 50 dims)")
+        print("=" * 70)
+        genome_lookup, genome_cols = build_genome_embeddings()
+        show("genome_embeddings", genome_lookup)
+
+        print("\n" + "=" * 70)
+        print("PASS 1 - streaming aggregation (user/movie stats, favorite genre, recent history)")
+        print("=" * 70)
+        user_stats, movie_stats, user_genre_counts, recent_hist = run_pass_one(genre_pairs)
+
+        favorite_idx = user_genre_counts.groupby("userId")["count"].idxmax()
+        favorite_genre = user_genre_counts.loc[favorite_idx, ["userId", "genre"]].rename(
+            columns={"genre": "favorite_genre"}
+        )
+
+        user_ids = list(recent_hist.keys())
+        recent_df = build_recent_movie_columns(user_ids, recent_hist)
+
+        print("\n" + "=" * 70)
+        print("2. USER FEATURES")
+        print("=" * 70)
+        user_features = finalize_user_stats(user_stats)
+        user_features["user_segment"] = user_features["total_ratings"].apply(segment_label).astype("category")
+        user_features = user_features.merge(favorite_genre, on="userId", how="left")
+        user_features = user_features.merge(recent_df, on="userId", how="left")
+        user_features = user_features[
+            [
+                "userId", "total_ratings", "avg_rating", "rating_std", "min_rating", "max_rating",
+                "favorite_genre", "user_segment",
+                "recent_movie_1", "recent_movie_2", "recent_movie_3", "recent_movie_4", "recent_movie_5",
+                "avg_reward",
+            ]
+        ]
+        show("user_features", user_features)
+        user_features.to_parquet(user_features_path, index=False)
+        print(f"Saved -> {user_features_path}")
+
+        print("\nUser segment counts:")
+        print(user_features["user_segment"].value_counts())
+
+        print("\n" + "=" * 70)
+        print("3. MOVIE FEATURES")
+        print("=" * 70)
+        movie_features = finalize_movie_stats(movie_stats)
+        movie_features = movie_features.merge(movies[["movieId", "genres"]], on="movieId", how="left")
+        movie_features = movie_features.merge(genome_lookup, on="movieId", how="left")
+        movie_features[genome_cols] = movie_features[genome_cols].fillna(0.0)
+        movie_features = movie_features[
+            ["movieId", "total_ratings", "avg_rating", "rating_std", "genres"] + genome_cols
+        ]
+        show("movie_features", movie_features)
+        movie_features.to_parquet(movie_features_path, index=False)
+        print(f"Saved -> {movie_features_path}")
+
+        print("\n" + "=" * 70)
+        print("PASS 2 - streaming rl_features.parquet to disk")
+        print("=" * 70)
+        user_segment_lookup = user_features[["userId", "user_segment"]]
+        rl_rows = run_pass_two(user_segment_lookup)
+        print(f"Saved -> {rl_features_path} ({rl_rows:,} rows)")
 
     print("\n" + "=" * 70)
     print("6. OUTPUT FILE REPORT")
     print("=" * 70)
-    print(f"\n{forecasting_path.name} (unchanged, left as-is)")
-    print(f"  File size on disk: {forecasting_path.stat().st_size / 1e6:,.1f} MB")
-
+    report_output_file(forecasting_path, forecasting_features)
     report_output_file(user_features_path, user_features)
     report_output_file(movie_features_path, movie_features)
     report_output_file(rl_features_path)
