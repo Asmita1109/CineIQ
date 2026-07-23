@@ -1,26 +1,45 @@
-"""Build feature tables for the forecasting, recommendation, and RL components.
+"""Build feature tables for the recommendation and RL components from
+data/processed/ (ml-latest), saved as Parquet.
 
-Processes ratings_clean.csv in chunks (CHUNK_SIZE rows at a time) so the
-pipeline never holds the full ratings table in memory. Aggregates (user/movie
-stats, genre-month counts, favorite genre, recent history) are accumulated
-chunk-by-chunk in a first streaming pass and combined at the end. A second
-streaming pass then merges each chunk against those small, precomputed lookup
-tables and appends the row-level feature tables straight to disk.
+This is a normalized redesign: earlier versions joined per-user and per-movie
+features (including 50-dim genome embeddings) onto every rating event, which
+blew rec_features.csv/rl_features.csv up to ~20GB CSVs each and repeatedly
+died mid-write. Now genome embeddings live once per movie in
+movie_features.parquet, user aggregates live once per user in
+user_features.parquet, and rl_features.parquet is a narrow interaction log
+(userId, movieId, rating, timestamp, reward, user_segment) that a downstream
+consumer joins against the other two at train time instead of storing the
+join pre-computed and duplicated.
+
+ratings_clean.csv (>1GB) is streamed in 500,000-row chunks across two passes:
+pass 1 accumulates every aggregate (user/movie stats, favorite genre, recent
+history) from small per-chunk partials combined at the end; pass 2 streams
+the file again and writes rl_features.parquet incrementally via
+pyarrow.parquet.ParquetWriter. genome_scores_clean.csv is also streamed in
+500,000-row chunks to build the movie x tag matrix for SVD.
+
+forecasting_features.csv already exists from a prior run and is left as-is.
 """
 
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import pyarrow as pa
+import pyarrow.parquet as pq
+from sklearn.decomposition import TruncatedSVD
 
 DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 PROCESSED_DIR = DATA_DIR / "processed"
 FEATURES_DIR = DATA_DIR / "features"
 
+CHUNK_SIZE_THRESHOLD_BYTES = 1_000_000_000  # 1 GB -- only chunk files larger than this
 CHUNK_SIZE = 500_000
 RATING_POSITIVE_THRESHOLD = 4.0
 CASUAL_MAX = 20
 REGULAR_MAX = 100
+GENOME_SVD_COMPONENTS = 50
+RECENT_HISTORY_LEN = 5
 
 RATINGS_DTYPES = {
     "userId": "int32",
@@ -30,12 +49,18 @@ RATINGS_DTYPES = {
     "year": "int16",
     "month": "int8",
 }
+GENOME_DTYPES = {"movieId": "int32", "tagId": "int16", "relevance": "float32"}
 
 
 def ratings_chunks():
-    return pd.read_csv(
-        PROCESSED_DIR / "ratings_clean.csv", dtype=RATINGS_DTYPES, chunksize=CHUNK_SIZE
-    )
+    path = PROCESSED_DIR / "ratings_clean.csv"
+    size_gb = path.stat().st_size / 1e9
+    if path.stat().st_size > CHUNK_SIZE_THRESHOLD_BYTES:
+        print(f"ratings_clean.csv is {size_gb:.2f} GB (> 1GB) -- streaming in {CHUNK_SIZE:,}-row chunks")
+        yield from pd.read_csv(path, dtype=RATINGS_DTYPES, chunksize=CHUNK_SIZE)
+    else:
+        print(f"ratings_clean.csv is {size_gb:.2f} GB (<= 1GB) -- loading in a single pass")
+        yield pd.read_csv(path, dtype=RATINGS_DTYPES)
 
 
 def load_movie_genres():
@@ -59,6 +84,57 @@ def show(name, df):
     print(df.head())
 
 
+def report_output_file(path, df=None):
+    file_size_bytes = path.stat().st_size
+    print(f"\n{path.name}")
+    print(f"  File size on disk: {file_size_bytes / 1e6:,.1f} MB")
+    if df is None:
+        df = pd.read_parquet(path)
+    mem = df.memory_usage(deep=True).sum()
+    print(f"  Shape: {df.shape}")
+    print(f"  In-memory usage: {mem / 1e6:,.1f} MB")
+    print("  Sample rows:")
+    print(df.head(5).to_string(index=False))
+
+
+# ------------------------------------------------------------------
+# Genome embeddings: stream genome_scores_clean.csv in chunks to build the
+# movie x tag matrix, then compress 1,128 dims -> 50 via SVD.
+# ------------------------------------------------------------------
+def build_genome_embeddings(n_components=GENOME_SVD_COMPONENTS):
+    path = PROCESSED_DIR / "genome_scores_clean.csv"
+
+    print(f"Pass A - discovering movieId/tagId sets from {path.name} in {CHUNK_SIZE:,}-row chunks")
+    movie_ids = set()
+    tag_ids = set()
+    for chunk in pd.read_csv(path, dtype=GENOME_DTYPES, usecols=["movieId", "tagId"], chunksize=CHUNK_SIZE):
+        movie_ids.update(chunk["movieId"].unique().tolist())
+        tag_ids.update(chunk["tagId"].unique().tolist())
+    movie_ids = sorted(movie_ids)
+    tag_ids = sorted(tag_ids)
+    movie_index = {m: i for i, m in enumerate(movie_ids)}
+    tag_index = {t: i for i, t in enumerate(tag_ids)}
+    print(f"  {len(movie_ids):,} movies x {len(tag_ids):,} tags")
+
+    matrix = np.zeros((len(movie_ids), len(tag_ids)), dtype="float32")
+
+    print(f"Pass B - filling the movie x tag matrix in {CHUNK_SIZE:,}-row chunks")
+    for chunk in pd.read_csv(path, dtype=GENOME_DTYPES, chunksize=CHUNK_SIZE):
+        rows = chunk["movieId"].map(movie_index).to_numpy()
+        cols = chunk["tagId"].map(tag_index).to_numpy()
+        matrix[rows, cols] = chunk["relevance"].to_numpy(dtype="float32")
+
+    svd = TruncatedSVD(n_components=n_components, random_state=42)
+    embedding = svd.fit_transform(matrix)
+    explained = svd.explained_variance_ratio_.sum()
+    print(f"  SVD: {len(tag_ids)} dims -> {n_components} dims (explained variance ratio: {explained:.3f})")
+
+    cols_out = [f"genome_emb_{i}" for i in range(n_components)]
+    embedding_df = pd.DataFrame(embedding, columns=cols_out).astype("float32").round(6)
+    embedding_df.insert(0, "movieId", movie_ids)
+    return embedding_df, cols_out
+
+
 # ------------------------------------------------------------------
 # Pass 1: stream ratings_clean.csv once, accumulate every aggregate
 # ------------------------------------------------------------------
@@ -66,7 +142,6 @@ def run_pass_one(genre_pairs):
     user_partials = []
     movie_partials = []
     user_genre_partials = []
-    genre_month_partials = []
     recent_hist = {}
 
     n_chunks = 0
@@ -76,10 +151,16 @@ def run_pass_one(genre_pairs):
         n_rows += len(chunk)
         chunk = chunk.copy()
         chunk["rating_sq"] = chunk["rating"].astype("float64") ** 2
+        chunk["reward"] = (chunk["rating"] >= RATING_POSITIVE_THRESHOLD).astype("int32")
 
         user_partials.append(
             chunk.groupby("userId").agg(
-                count=("rating", "size"), sum=("rating", "sum"), sumsq=("rating_sq", "sum")
+                count=("rating", "size"),
+                sum=("rating", "sum"),
+                sumsq=("rating_sq", "sum"),
+                min=("rating", "min"),
+                max=("rating", "max"),
+                reward_sum=("reward", "sum"),
             )
         )
         movie_partials.append(
@@ -92,16 +173,11 @@ def run_pass_one(genre_pairs):
         user_genre_partials.append(
             chunk_genre.groupby(["userId", "genre"]).size().rename("count").reset_index()
         )
-        genre_month_partials.append(
-            chunk_genre.groupby(["genre", "year", "month"])
-            .agg(count=("rating", "size"), sum=("rating", "sum"))
-            .reset_index()
-        )
 
         top5_chunk = (
             chunk.sort_values("timestamp", ascending=False)
             .groupby("userId")
-            .head(5)[["userId", "timestamp", "movieId"]]
+            .head(RECENT_HISTORY_LEN)[["userId", "timestamp", "movieId"]]
         )
         for uid, ts, mid in zip(
             top5_chunk["userId"].to_numpy(),
@@ -110,31 +186,31 @@ def run_pass_one(genre_pairs):
         ):
             lst = recent_hist.setdefault(int(uid), [])
             lst.append((int(ts), int(mid)))
-            if len(lst) > 5:
+            if len(lst) > RECENT_HISTORY_LEN:
                 lst.sort(key=lambda x: x[0], reverse=True)
-                del lst[5:]
+                del lst[RECENT_HISTORY_LEN:]
 
         print(f"  Pass 1 - chunk {n_chunks}: {n_rows:,} rows processed so far")
 
-    user_stats = pd.concat(user_partials).groupby("userId").sum().reset_index()
+    user_stats = (
+        pd.concat(user_partials)
+        .groupby("userId")
+        .agg(count=("count", "sum"), sum=("sum", "sum"), sumsq=("sumsq", "sum"),
+             min=("min", "min"), max=("max", "max"), reward_sum=("reward_sum", "sum"))
+        .reset_index()
+    )
     movie_stats = pd.concat(movie_partials).groupby("movieId").sum().reset_index()
     user_genre_counts = (
         pd.concat(user_genre_partials).groupby(["userId", "genre"])["count"].sum().reset_index()
-    )
-    genre_month_counts = (
-        pd.concat(genre_month_partials)
-        .groupby(["genre", "year", "month"])
-        .sum(numeric_only=True)
-        .reset_index()
     )
 
     for lst in recent_hist.values():
         lst.sort(key=lambda x: x[0], reverse=True)
 
-    return user_stats, movie_stats, user_genre_counts, genre_month_counts, recent_hist
+    return user_stats, movie_stats, user_genre_counts, recent_hist
 
 
-def finalize_stats(raw, id_col, prefix):
+def finalize_movie_stats(raw):
     df = raw.copy()
     count = df["count"]
     mean = df["sum"] / count
@@ -142,160 +218,169 @@ def finalize_stats(raw, id_col, prefix):
     var = (df["sumsq"] - count * mean**2) / denom
     var = var.clip(lower=0).where(count > 1, 0.0)
 
-    out = pd.DataFrame(
+    return pd.DataFrame(
         {
-            id_col: df[id_col],
-            f"{prefix}_total_ratings": count.astype("int32"),
-            f"{prefix}_avg_rating": mean.astype("float32"),
-            f"{prefix}_rating_std": np.sqrt(var).astype("float32"),
+            "movieId": df["movieId"],
+            "total_ratings": count.astype("int32"),
+            "avg_rating": mean.astype("float32"),
+            "rating_std": np.sqrt(var).astype("float32"),
         }
     )
-    return out
 
 
-def build_forecasting_features(genre_month_counts):
-    genre_month = genre_month_counts.rename(columns={"count": "rating_count", "sum": "rating_sum"})
-    genre_month["avg_rating"] = genre_month["rating_sum"] / genre_month["rating_count"]
-    genre_month["period"] = pd.PeriodIndex.from_fields(
-        year=genre_month["year"], month=genre_month["month"], freq="M"
+def finalize_user_stats(raw):
+    df = raw.copy()
+    count = df["count"]
+    mean = df["sum"] / count
+    denom = (count - 1).clip(lower=1)
+    var = (df["sumsq"] - count * mean**2) / denom
+    var = var.clip(lower=0).where(count > 1, 0.0)
+
+    return pd.DataFrame(
+        {
+            "userId": df["userId"],
+            "total_ratings": count.astype("int32"),
+            "avg_rating": mean.astype("float32"),
+            "rating_std": np.sqrt(var).astype("float32"),
+            "min_rating": df["min"].astype("float32"),
+            "max_rating": df["max"].astype("float32"),
+            "avg_reward": (df["reward_sum"] / count).astype("float32"),
+        }
     )
 
-    all_periods = pd.period_range(genre_month["period"].min(), genre_month["period"].max(), freq="M")
-    genres = sorted(genre_month["genre"].unique())
-    full_index = pd.MultiIndex.from_product([genres, all_periods], names=["genre", "period"])
 
-    genre_month_full = (
-        genre_month.set_index(["genre", "period"])[["rating_count", "avg_rating"]]
-        .reindex(full_index)
-        .reset_index()
-    )
-    genre_month_full["rating_count"] = genre_month_full["rating_count"].fillna(0).astype("int32")
-    genre_month_full["year"] = genre_month_full["period"].dt.year.astype("int16")
-    genre_month_full["month"] = genre_month_full["period"].dt.month.astype("int8")
-    genre_month_full = genre_month_full.sort_values(["genre", "period"]).reset_index(drop=True)
-
-    counts = genre_month_full.groupby("genre")["rating_count"]
-    genre_month_full["lag_1"] = counts.shift(1)
-    genre_month_full["lag_2"] = counts.shift(2)
-    genre_month_full["lag_3"] = counts.shift(3)
-    genre_month_full["rolling_3month_avg"] = counts.transform(
-        lambda s: s.rolling(window=3, min_periods=1).mean()
-    )
-    genre_month_full["rolling_6month_avg"] = counts.transform(
-        lambda s: s.rolling(window=6, min_periods=1).mean()
-    )
-
-    return genre_month_full[
-        [
-            "genre",
-            "year",
-            "month",
-            "rating_count",
-            "avg_rating",
-            "lag_1",
-            "lag_2",
-            "lag_3",
-            "rolling_3month_avg",
-            "rolling_6month_avg",
-        ]
-    ]
+def build_recent_movie_columns(user_ids, recent_hist):
+    rows = []
+    for uid in user_ids:
+        movie_list = [mid for _, mid in recent_hist[uid]]
+        movie_list = movie_list + [None] * (RECENT_HISTORY_LEN - len(movie_list))
+        rows.append(movie_list)
+    cols = [f"recent_movie_{i + 1}" for i in range(RECENT_HISTORY_LEN)]
+    recent_df = pd.DataFrame(rows, columns=cols)
+    for c in cols:
+        recent_df[c] = recent_df[c].astype("Int32")
+    recent_df.insert(0, "userId", user_ids)
+    return recent_df
 
 
 # ------------------------------------------------------------------
-# Pass 2: stream ratings_clean.csv again, merge against small lookup
-# tables built in pass 1, and append each chunk straight to disk.
+# Pass 2: stream ratings_clean.csv again, merge the (tiny) user_segment
+# lookup onto each chunk, and write rl_features.parquet incrementally.
 # ------------------------------------------------------------------
-def run_pass_two(user_agg, movie_agg, user_segment_map, recent_movie_ids):
-    rec_path = FEATURES_DIR / "rec_features.csv"
-    rl_path = FEATURES_DIR / "rl_features.csv"
-    rec_path.unlink(missing_ok=True)
+def run_pass_two(user_segment_lookup):
+    rl_path = FEATURES_DIR / "rl_features.parquet"
     rl_path.unlink(missing_ok=True)
 
-    header_written = False
+    writer = None
     n_chunks = 0
-    rec_rows = 0
     rl_rows = 0
 
     for chunk in ratings_chunks():
         n_chunks += 1
 
-        rec_chunk = chunk[["userId", "movieId", "rating"]].merge(user_agg, on="userId", how="left")
-        rec_chunk = rec_chunk.merge(movie_agg, on="movieId", how="left")
-        rec_chunk.to_csv(rec_path, mode="a", header=not header_written, index=False)
-        rec_rows += len(rec_chunk)
-
-        rl_chunk = chunk[["userId", "movieId", "rating", "year", "month"]].copy()
+        rl_chunk = chunk[["userId", "movieId", "rating", "timestamp"]].copy()
         rl_chunk["reward"] = (rl_chunk["rating"] >= RATING_POSITIVE_THRESHOLD).astype("int8")
-        rl_chunk["user_segment"] = rl_chunk["userId"].map(user_segment_map)
-        rl_chunk["recent_movie_ids"] = rl_chunk["userId"].map(recent_movie_ids)
-        rl_chunk.to_csv(rl_path, mode="a", header=not header_written, index=False)
+        rl_chunk = rl_chunk.merge(user_segment_lookup, on="userId", how="left")
+        rl_chunk["user_segment"] = rl_chunk["user_segment"].astype("category")
+
+        table = pa.Table.from_pandas(rl_chunk, preserve_index=False)
+        if writer is None:
+            writer = pq.ParquetWriter(rl_path, table.schema)
+        writer.write_table(table)
         rl_rows += len(rl_chunk)
 
-        header_written = True
-        print(f"  Pass 2 - chunk {n_chunks}: {rec_rows:,} rows written so far")
+        print(f"  Pass 2 - chunk {n_chunks}: {rl_rows:,} rows written so far")
 
-    return rec_rows, rl_rows
+    if writer is not None:
+        writer.close()
+
+    return rl_rows
 
 
 def main():
     FEATURES_DIR.mkdir(parents=True, exist_ok=True)
 
-    print(f"Streaming ratings_clean.csv in chunks of {CHUNK_SIZE:,} rows")
+    forecasting_path = FEATURES_DIR / "forecasting_features.csv"
+    if forecasting_path.exists():
+        print(f"Skipping forecasting features -- {forecasting_path} already exists, left as-is.")
+    else:
+        print(f"Warning: {forecasting_path} not found. This run does not regenerate it.")
+
     movies, genre_pairs = load_movie_genres()
     print(f"movies_clean: {movies.shape}")
 
     print("\n" + "=" * 70)
-    print("PASS 1 - streaming aggregation (user/movie stats, genre-month, recent history)")
+    print("GENOME EMBEDDINGS (chunked SVD compression, 1,128 -> 50 dims)")
     print("=" * 70)
-    user_stats, movie_stats, user_genre_counts, genre_month_counts, recent_hist = run_pass_one(
-        genre_pairs
-    )
+    genome_lookup, genome_cols = build_genome_embeddings()
+    show("genome_embeddings", genome_lookup)
 
-    user_agg = finalize_stats(user_stats, "userId", "user")
-    movie_agg = finalize_stats(movie_stats, "movieId", "movie")
+    print("\n" + "=" * 70)
+    print("PASS 1 - streaming aggregation (user/movie stats, favorite genre, recent history)")
+    print("=" * 70)
+    user_stats, movie_stats, user_genre_counts, recent_hist = run_pass_one(genre_pairs)
 
     favorite_idx = user_genre_counts.groupby("userId")["count"].idxmax()
     favorite_genre = user_genre_counts.loc[favorite_idx, ["userId", "genre"]].rename(
-        columns={"genre": "user_favorite_genre"}
+        columns={"genre": "favorite_genre"}
     )
-    user_agg = user_agg.merge(favorite_genre, on="userId", how="left")
 
-    movie_agg = movie_agg.merge(movies[["movieId", "genres"]], on="movieId", how="left")
-    movie_agg = movie_agg.rename(columns={"genres": "movie_genres"})
-
-    user_segment = user_agg[["userId", "user_total_ratings"]].copy()
-    user_segment["user_segment"] = user_segment["user_total_ratings"].apply(segment_label)
-    user_segment_map = user_segment.set_index("userId")["user_segment"]
-
-    recent_movie_ids = {
-        uid: "|".join(str(mid) for _, mid in lst) for uid, lst in recent_hist.items()
-    }
+    user_ids = list(recent_hist.keys())
+    recent_df = build_recent_movie_columns(user_ids, recent_hist)
 
     print("\n" + "=" * 70)
-    print("1. FORECASTING FEATURES")
+    print("2. USER FEATURES")
     print("=" * 70)
-    forecasting_features = build_forecasting_features(genre_month_counts)
-    show("forecasting_features", forecasting_features)
-    forecasting_features.to_csv(FEATURES_DIR / "forecasting_features.csv", index=False)
-    print(f"Saved -> {FEATURES_DIR / 'forecasting_features.csv'}")
+    user_features = finalize_user_stats(user_stats)
+    user_features["user_segment"] = user_features["total_ratings"].apply(segment_label).astype("category")
+    user_features = user_features.merge(favorite_genre, on="userId", how="left")
+    user_features = user_features.merge(recent_df, on="userId", how="left")
+    user_features = user_features[
+        [
+            "userId", "total_ratings", "avg_rating", "rating_std", "min_rating", "max_rating",
+            "favorite_genre", "user_segment",
+            "recent_movie_1", "recent_movie_2", "recent_movie_3", "recent_movie_4", "recent_movie_5",
+            "avg_reward",
+        ]
+    ]
+    show("user_features", user_features)
+    user_features_path = FEATURES_DIR / "user_features.parquet"
+    user_features.to_parquet(user_features_path, index=False)
+    print(f"Saved -> {user_features_path}")
 
-    print("\n" + "=" * 70)
-    print("2/3. RECOMMENDATION + RL LOOKUP TABLES")
-    print("=" * 70)
-    show("user_features", user_agg)
-    show("movie_features", movie_agg)
     print("\nUser segment counts:")
-    print(user_segment["user_segment"].value_counts())
+    print(user_features["user_segment"].value_counts())
 
     print("\n" + "=" * 70)
-    print("PASS 2 - streaming rec_features.csv / rl_features.csv to disk")
+    print("3. MOVIE FEATURES")
     print("=" * 70)
-    rec_rows, rl_rows = run_pass_two(user_agg, movie_agg, user_segment_map, recent_movie_ids)
-    print(f"\nSaved -> {FEATURES_DIR / 'rec_features.csv'} ({rec_rows:,} rows)")
-    print(f"Saved -> {FEATURES_DIR / 'rl_features.csv'} ({rl_rows:,} rows)")
+    movie_features = finalize_movie_stats(movie_stats)
+    movie_features = movie_features.merge(movies[["movieId", "genres"]], on="movieId", how="left")
+    movie_features = movie_features.merge(genome_lookup, on="movieId", how="left")
+    movie_features[genome_cols] = movie_features[genome_cols].fillna(0.0)
+    movie_features = movie_features[["movieId", "total_ratings", "avg_rating", "rating_std", "genres"] + genome_cols]
+    show("movie_features", movie_features)
+    movie_features_path = FEATURES_DIR / "movie_features.parquet"
+    movie_features.to_parquet(movie_features_path, index=False)
+    print(f"Saved -> {movie_features_path}")
 
-    show("rec_features (sample)", pd.read_csv(FEATURES_DIR / "rec_features.csv", nrows=5))
-    show("rl_features (sample)", pd.read_csv(FEATURES_DIR / "rl_features.csv", nrows=5))
+    print("\n" + "=" * 70)
+    print("PASS 2 - streaming rl_features.parquet to disk")
+    print("=" * 70)
+    user_segment_lookup = user_features[["userId", "user_segment"]]
+    rl_rows = run_pass_two(user_segment_lookup)
+    rl_features_path = FEATURES_DIR / "rl_features.parquet"
+    print(f"Saved -> {rl_features_path} ({rl_rows:,} rows)")
+
+    print("\n" + "=" * 70)
+    print("6. OUTPUT FILE REPORT")
+    print("=" * 70)
+    print(f"\n{forecasting_path.name} (unchanged, left as-is)")
+    print(f"  File size on disk: {forecasting_path.stat().st_size / 1e6:,.1f} MB")
+
+    report_output_file(user_features_path, user_features)
+    report_output_file(movie_features_path, movie_features)
+    report_output_file(rl_features_path)
 
 
 if __name__ == "__main__":
