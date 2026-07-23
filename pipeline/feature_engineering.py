@@ -1,24 +1,12 @@
-"""Build feature tables for the recommendation and RL components from
-data/processed/ (ml-latest), saved as Parquet.
+"""
+CineIQ -- Feature Engineering
 
-This is a normalized redesign: earlier versions joined per-user and per-movie
-features (including 50-dim genome embeddings) onto every rating event, which
-blew rec_features.csv/rl_features.csv up to ~20GB CSVs each and repeatedly
-died mid-write. Now genome embeddings live once per movie in
-movie_features.parquet, user aggregates live once per user in
-user_features.parquet, and rl_features.parquet is a narrow interaction log
-(userId, movieId, rating, timestamp, reward, user_segment) that a downstream
-consumer joins against the other two at train time instead of storing the
-join pre-computed and duplicated.
+Builds three feature tables from 33.8M real movie ratings (1995-2023):
+- user_features.parquet: one row per user, captures rating behavior and preferences
+- movie_features.parquet: one row per movie, includes genre and content embeddings
+- rl_features.parquet: full interaction log used to train the RL agent
 
-ratings_clean.csv (>1GB) is streamed in 500,000-row chunks across two passes:
-pass 1 accumulates every aggregate (user/movie stats, favorite genre, recent
-history) from small per-chunk partials combined at the end; pass 2 streams
-the file again and writes rl_features.parquet incrementally via
-pyarrow.parquet.ParquetWriter. genome_scores_clean.csv is also streamed in
-500,000-row chunks to build the movie x tag matrix for SVD.
-
-forecasting_features.csv already exists from a prior run and is left as-is.
+Input: data/processed/ | Output: data/features/
 """
 
 from pathlib import Path
