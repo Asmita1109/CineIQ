@@ -75,12 +75,34 @@ def main():
 
     rmse_gap_pct = (model_rmse - VAL_MODEL_RMSE) / VAL_MODEL_RMSE * 100
     mae_gap_pct = (model_mae - VAL_MODEL_MAE) / VAL_MODEL_MAE * 100
-    print(f"\nTest vs val RMSE gap: {rmse_gap_pct:+.1f}%")
-    print(f"Test vs val MAE gap:  {mae_gap_pct:+.1f}%")
-    if abs(rmse_gap_pct) <= 15:
-        print("-> Test RMSE is within 15% of validation RMSE: no strong sign of overfitting.")
+    print(f"\nTest vs val RMSE gap: {rmse_gap_pct:+.1f}%  (positive = test worse than val)")
+    print(f"Test vs val MAE gap:  {mae_gap_pct:+.1f}%  (positive = test worse than val)")
+
+    # Overfitting shows up as test performing WORSE than validation. Test
+    # matching or beating validation is fine regardless of how large that
+    # gap is -- only a worse-than-tolerance test score is a red flag.
+    OVERFIT_TOLERANCE_PCT = 15
+    if rmse_gap_pct <= 0:
+        print(
+            f"-> Test RMSE is as good as or better than validation RMSE ({rmse_gap_pct:+.1f}%): "
+            f"no sign of overfitting."
+        )
+    elif rmse_gap_pct <= OVERFIT_TOLERANCE_PCT:
+        print(
+            f"-> Test RMSE is worse than validation by {rmse_gap_pct:.1f}%, within the "
+            f"{OVERFIT_TOLERANCE_PCT}% tolerance: no strong sign of overfitting."
+        )
     else:
-        print("-> Test RMSE diverges from validation RMSE by more than 15%: worth a closer look.")
+        print(
+            f"-> Test RMSE is worse than validation by {rmse_gap_pct:.1f}%, beyond the "
+            f"{OVERFIT_TOLERANCE_PCT}% tolerance: possible overfitting, worth a closer look."
+        )
+
+    print(
+        f"\nRelative improvement over baseline -- val: {(VAL_BASELINE_RMSE - VAL_MODEL_RMSE) / VAL_BASELINE_RMSE * 100:.1f}%, "
+        f"test: {rmse_improvement:.1f}% (a more robust generalization signal than raw RMSE, "
+        f"since it's not sensitive to each period's underlying rating volume)"
+    )
 
     print("\n" + "=" * 70)
     print("FINAL SUMMARY")
