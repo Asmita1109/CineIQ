@@ -43,12 +43,26 @@ TRAINING_IMAGE = (
 )
 
 HYPERPARAMETERS = {
-    "embedding_dim": "32",
-    "lr": "0.001",
+    "embedding_dim": "64",
+    "lr": "0.0005",  # sagemaker_train.py's arg is --lr, not --learning_rate
+    "hidden_layers": "256,128,64,32",
+    "dropout": "0.3",
     "batch_size": "1024",
-    "max_epochs": "20",
-    "patience": "5",
+    "max_epochs": "30",
+    "patience": "7",
+    "neg_samples": "4",
 }
+
+# CloudWatch parses these regexes out of the training container's stdout
+# (train_model()'s per-epoch print line) into queryable SageMaker Metrics --
+# without this, metrics only exist as raw log text (see fetch_training_results.py,
+# written for Version 2 back when this wasn't configured).
+METRIC_DEFINITIONS = [
+    {"Name": "train:bpr_loss", "Regex": r"BPR loss: ([0-9\.]+)"},
+    {"Name": "validation:ndcg_10", "Regex": r"val NDCG@10: ([0-9\.]+)"},
+    {"Name": "validation:precision_10", "Regex": r"val Precision@10: ([0-9\.]+)"},
+    {"Name": "validation:recall_10", "Regex": r"val Recall@10: ([0-9\.]+)"},
+]
 
 # ml.m5.2xlarge on-demand SageMaker training price, us-east-1 (2x the vCPU/RAM
 # of ml.m5.xlarge, and ~2x the price in the m5 family). Confirm the current
@@ -56,7 +70,7 @@ HYPERPARAMETERS = {
 # for budgeting -- it changes and varies by region.
 INSTANCE_HOURLY_USD = 0.461
 
-SOURCE_FILES = ["model.py", "train.py", "sagemaker_train.py"]
+SOURCE_FILES = ["model.py", "train.py", "evaluate.py", "sagemaker_train.py"]
 
 
 def print_iam_role_instructions():
@@ -154,7 +168,11 @@ def build_job_config(job_name, role_arn, hyperparameters):
 
     return {
         "TrainingJobName": job_name,
-        "AlgorithmSpecification": {"TrainingImage": TRAINING_IMAGE, "TrainingInputMode": "File"},
+        "AlgorithmSpecification": {
+            "TrainingImage": TRAINING_IMAGE,
+            "TrainingInputMode": "File",
+            "MetricDefinitions": METRIC_DEFINITIONS,
+        },
         "RoleArn": role_arn,
         "InputDataConfig": [
             channel("train", "rec_train.parquet"),

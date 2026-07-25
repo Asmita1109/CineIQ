@@ -1,17 +1,27 @@
-"""SageMaker entry point for training the CineIQ NCF recommender.
+"""SageMaker entry point for training the CineIQ NCF recommender -- Version 3
+(BPR pairwise ranking loss).
 
 Wraps train.train_model() so the exact same model/loss/optimizer/eval logic
 runs locally and in a SageMaker training job -- only the data loading
 strategy, data/model paths, and hyperparameter source change. Deploy by
-pointing a SageMaker Estimator's source_dir at src/recommender/ (so model.py
-and train.py ship alongside this script) and entry_point at
+pointing a SageMaker Estimator's source_dir at src/recommender/ (so model.py,
+train.py, and evaluate.py all ship alongside this script -- train.py imports
+ranking-metric helpers from evaluate.py) and entry_point at
 "sagemaker_train.py".
 
-Uses CineIQIterableDataset (chunked pyarrow reads, 500K rows at a time) for
-both rec_train.parquet and rec_val.parquet instead of train.py's default
-CineIQDataset (loads the full interaction log into memory), since the full
-in-memory join can OOM a smaller training instance like ml.m5.xlarge (16GB
-RAM) -- see model.CineIQIterableDataset for how batching/remainders work.
+Uses CineIQBPRIterableDataset (chunked pyarrow reads, 500K rows at a time)
+for rec_train.parquet instead of train.py's default CineIQBPRDataset (loads
+all positive interactions into memory), since the full in-memory load can
+OOM a smaller training instance like ml.m5.xlarge (16GB RAM) -- see
+model.CineIQBPRIterableDataset for how batching/remainders/negative sampling
+work per chunk.
+
+Negative sampling excludes each user's full rating history when possible,
+but rl_features.parquet (the fullest interaction log) isn't one of the
+channeled files here -- train_model() detects it's absent in this container
+and falls back to excluding whatever the train + val channels alone show,
+which is what train_model()'s rated_history_path=None default already does
+automatically; no extra channel is needed.
 
 Expects four data channels passed to Estimator.fit({...}) (matches
 launch_sagemaker.py's four-channel job config):
@@ -25,7 +35,7 @@ import argparse
 import os
 from pathlib import Path
 
-from model import CineIQIterableDataset
+from model import CineIQBPRIterableDataset
 from train import train_model
 
 # SageMaker conventions: each channel passed to Estimator.fit() is mounted at
@@ -41,12 +51,17 @@ def parse_args():
 
     # Hyperparameters -- SageMaker passes Estimator(hyperparameters={...}) as
     # CLI args to the entry point script.
-    parser.add_argument("--embedding_dim", type=int, default=32)
-    parser.add_argument("--lr", type=float, default=0.001)
+    parser.add_argument("--embedding_dim", type=int, default=64)
+    parser.add_argument("--lr", type=float, default=0.0005)
     parser.add_argument("--batch_size", type=int, default=1024)
-    parser.add_argument("--max_epochs", type=int, default=50)
-    parser.add_argument("--patience", type=int, default=5)
+    parser.add_argument("--max_epochs", type=int, default=30)
+    parser.add_argument("--patience", type=int, default=7)
     parser.add_argument("--hidden_layers", type=str, default="128,64,32")
+    parser.add_argument("--dropout", type=float, default=0.2)
+    parser.add_argument("--neg_samples", type=int, default=4, help="Negatives sampled per positive interaction")
+    parser.add_argument(
+        "--val_neg_samples", type=int, default=100, help="Negatives sampled per user for validation ranking metrics"
+    )
     parser.add_argument(
         "--chunk_size", type=int, default=500_000, help="Rows read per pyarrow batch while streaming"
     )
@@ -93,7 +108,8 @@ def main():
     print(f"model_dir:              {model_dir}")
     print(
         f"hyperparameters:  embedding_dim={args.embedding_dim}  lr={args.lr}  "
-        f"batch_size={args.batch_size}  hidden_layers={hidden_layers}  "
+        f"batch_size={args.batch_size}  hidden_layers={hidden_layers}  dropout={args.dropout}  "
+        f"neg_samples={args.neg_samples}  val_neg_samples={args.val_neg_samples}  "
         f"max_epochs={args.max_epochs}  patience={args.patience}  chunk_size={args.chunk_size}"
     )
 
@@ -106,11 +122,14 @@ def main():
         figures_dir=None,  # no figures channel in the training container by default
         embedding_dim=args.embedding_dim,
         hidden_layers=hidden_layers,
+        dropout=args.dropout,
         lr=args.lr,
         batch_size=args.batch_size,
         max_epochs=args.max_epochs,
         patience=args.patience,
-        dataset_class=CineIQIterableDataset,
+        neg_samples=args.neg_samples,
+        val_neg_samples=args.val_neg_samples,
+        dataset_class=CineIQBPRIterableDataset,
         chunk_size=args.chunk_size,
     )
 

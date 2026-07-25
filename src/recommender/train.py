@@ -1,21 +1,38 @@
-"""Train the CineIQ NCF recommender.
+"""Train the CineIQ NCF recommender with BPR pairwise ranking loss (Version 3).
 
-The actual training loop lives in train_model() so it can be reused verbatim
-by sagemaker_train.py -- only the data/model paths and hyperparameter source
-differ between a local run and a SageMaker training job.
+Replaces the earlier pointwise approach (MSE against star ratings) with
+Bayesian Personalized Ranking: for each observed positive interaction,
+neg_samples movies the user has never rated are sampled, and the model is
+pushed to score the positive higher than each negative via
+loss = -log(sigmoid(score(positive) - score(negative))), averaged over every
+(positive, negative) pair in a batch.
+
+Validation now uses the same negative-sampling protocol as
+src/recommender/evaluate.py's test-set evaluation (100 negatives per user,
+rank the real held-out items among them) -- this file imports
+sample_negatives/score_candidates/per_user_ranking_metrics_negsample from
+evaluate.py rather than re-implementing already-validated logic, so
+training-time NDCG@10 is directly comparable to the final test-set numbers.
+
+The actual training loop lives in train_model() so it can be reused
+verbatim by sagemaker_train.py -- only the data/model paths, hyperparameter
+source, and data loading strategy (map-style vs. streamed) differ between a
+local run and a SageMaker training job.
 """
 
 from pathlib import Path
 
 import matplotlib.pyplot as plt
 import numpy as np
+import pandas as pd
 import seaborn as sns
 import torch
-from sklearn.metrics import ndcg_score
+import torch.nn.functional as F
 from torch import nn
 from torch.utils.data import DataLoader, IterableDataset
 
-from model import NCF, CineIQDataset, CineIQIterableDataset
+from evaluate import per_user_ranking_metrics_negsample, sample_negatives, score_candidates
+from model import NCF, CineIQBPRDataset, CineIQBPRIterableDataset
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 DATA_DIR = PROJECT_ROOT / "data"
@@ -23,81 +40,92 @@ FEATURES_DIR = DATA_DIR / "features"
 MODELS_DIR = PROJECT_ROOT / "models"
 FIGURES_DIR = MODELS_DIR / "figures"
 
-EMBEDDING_DIM = 32
+EMBEDDING_DIM = 64
 HIDDEN_LAYERS = (128, 64, 32)
+DROPOUT = 0.2
 BATCH_SIZE = 1024
-LEARNING_RATE = 0.001
-MAX_EPOCHS = 20
-EARLY_STOPPING_PATIENCE = 5
-NDCG_K = 10
+LEARNING_RATE = 0.0005
+MAX_EPOCHS = 30
+EARLY_STOPPING_PATIENCE = 7
+NEG_SAMPLES = 4          # training: negatives sampled per positive interaction
+VAL_NEG_SAMPLES = 100    # validation: negatives sampled per user, for ranking metrics
+K = 10
 PALETTE = "mako"
 
 
-def compute_ndcg_at_k(user_idx, y_true, y_pred, k=NDCG_K):
-    """Per-user NDCG@k, ranking each user's own known items by predicted
-    rating and scoring against the ideal (actual-rating-sorted) order."""
-    order = np.argsort(user_idx, kind="stable")
-    user_idx_sorted = user_idx[order]
-    y_true_sorted = y_true[order]
-    y_pred_sorted = y_pred[order]
-
-    unique_users, counts = np.unique(user_idx_sorted, return_counts=True)
-    group_size = counts[0]
-
-    if np.all(counts == group_size):
-        # fast path: fixed items/user (true for the leave-last-5-out rec split)
-        n_users = len(unique_users)
-        true_matrix = y_true_sorted.reshape(n_users, group_size)
-        pred_matrix = y_pred_sorted.reshape(n_users, group_size)
-        return float(ndcg_score(true_matrix, pred_matrix, k=k))
-
-    # fallback for ragged group sizes
-    scores = []
-    start = 0
-    for c in counts:
-        if c >= 2:
-            t = y_true_sorted[start:start + c].reshape(1, -1)
-            p = y_pred_sorted[start:start + c].reshape(1, -1)
-            scores.append(ndcg_score(t, p, k=k))
-        start += c
-    return float(np.mean(scores)) if scores else float("nan")
+def load_rating_history(paths, user_ids):
+    """Every movie any of user_ids has rated, per the given parquet file(s)
+    -- used to exclude true positives from validation negative sampling.
+    Pass a single path (e.g. rl_features.parquet, the fullest available
+    interaction log, used by default for local runs) or a list of paths
+    (e.g. [train_path, val_path] -- always available even on SageMaker,
+    where a full unified interaction-log channel isn't set up)."""
+    if isinstance(paths, (str, Path)):
+        paths = [paths]
+    user_id_set = set(user_ids)
+    frames = []
+    for p in paths:
+        df = pd.read_parquet(p, columns=["userId", "movieId"])
+        frames.append(df[df["userId"].isin(user_id_set)])
+    history = pd.concat(frames, ignore_index=True) if len(frames) > 1 else frames[0]
+    return history.drop_duplicates()
 
 
-@torch.no_grad()
-def evaluate(model, loader, device):
-    model.eval()
-    all_true, all_pred, all_users = [], [], []
-    for user_idx, movie_idx, genome, rating in loader:
-        user_idx, movie_idx, genome = user_idx.to(device), movie_idx.to(device), genome.to(device)
-        preds = model(user_idx, movie_idx, genome).cpu().numpy()
-        all_true.append(rating.numpy())
-        all_pred.append(preds)
-        all_users.append(user_idx.cpu().numpy())
+def bpr_loss(pos_score, neg_score):
+    """pos_score: (B,), neg_score: (B, neg_samples). Broadcasts pos_score
+    across the negative dimension and averages the loss over every
+    (positive, negative) pair in the batch."""
+    diff = pos_score.unsqueeze(1) - neg_score
+    return -F.logsigmoid(diff).mean()
 
-    y_true = np.concatenate(all_true)
-    y_pred = np.concatenate(all_pred)
-    users = np.concatenate(all_users)
 
-    rmse = float(np.sqrt(np.mean((y_true - y_pred) ** 2)))
-    ndcg = compute_ndcg_at_k(users, y_true, y_pred, k=NDCG_K)
-    return rmse, ndcg
+def train_epoch(model, loader, optimizer, device):
+    model.train()
+    total_loss = 0.0
+    n_examples = 0
+    for user_idx, pos_movie_idx, pos_genome, neg_movie_idx, neg_genome in loader:
+        batch_size, neg_samples = neg_movie_idx.shape
+
+        user_idx = user_idx.to(device)
+        pos_movie_idx = pos_movie_idx.to(device)
+        pos_genome = pos_genome.to(device)
+        neg_movie_idx = neg_movie_idx.to(device)
+        neg_genome = neg_genome.to(device)
+
+        optimizer.zero_grad()
+
+        pos_score = model(user_idx, pos_movie_idx, pos_genome)  # (B,)
+
+        user_idx_expanded = user_idx.unsqueeze(1).expand(-1, neg_samples).reshape(-1)
+        neg_movie_idx_flat = neg_movie_idx.reshape(-1)
+        neg_genome_flat = neg_genome.reshape(-1, neg_genome.shape[-1])
+        neg_score = model(user_idx_expanded, neg_movie_idx_flat, neg_genome_flat).reshape(batch_size, neg_samples)
+
+        loss = bpr_loss(pos_score, neg_score)
+        loss.backward()
+        optimizer.step()
+
+        total_loss += loss.item() * batch_size
+        n_examples += batch_size
+
+    return total_loss / n_examples
 
 
 def plot_training_curve(history, path):
-    epochs = range(1, len(history["train_loss"]) + 1)
-    train_rmse = [x**0.5 for x in history["train_loss"]]
+    epochs = range(1, len(history["train_bpr_loss"]) + 1)
     colors = sns.color_palette(PALETTE, 5)
 
     fig, ax1 = plt.subplots(figsize=(9, 5))
-    ax1.plot(epochs, train_rmse, label="train RMSE", color=colors[3])
-    ax1.plot(epochs, history["val_rmse"], label="val RMSE", color=colors[1])
+    ax1.plot(epochs, history["train_bpr_loss"], label="train BPR loss", color=colors[3])
     ax1.set_xlabel("Epoch")
-    ax1.set_ylabel("RMSE")
-    ax1.set_title("Recommender Training Curve")
+    ax1.set_ylabel("BPR loss")
+    ax1.set_title("Recommender Training Curve (BPR, Version 3)")
 
     ax2 = ax1.twinx()
-    ax2.plot(epochs, history["val_ndcg"], label=f"val NDCG@{NDCG_K}", color="firebrick", linestyle="--")
-    ax2.set_ylabel(f"NDCG@{NDCG_K}")
+    ax2.plot(epochs, history["val_ndcg"], label=f"val NDCG@{K}", color="firebrick", linestyle="--")
+    ax2.plot(epochs, history["val_precision"], label=f"val Precision@{K}", color="darkorange", linestyle=":")
+    ax2.plot(epochs, history["val_recall"], label=f"val Recall@{K}", color="seagreen", linestyle="-.")
+    ax2.set_ylabel("Ranking metric")
 
     lines1, labels1 = ax1.get_legend_handles_labels()
     lines2, labels2 = ax2.get_legend_handles_labels()
@@ -117,61 +145,63 @@ def train_model(
     figures_dir=None,
     embedding_dim=EMBEDDING_DIM,
     hidden_layers=HIDDEN_LAYERS,
+    dropout=DROPOUT,
     lr=LEARNING_RATE,
     batch_size=BATCH_SIZE,
     max_epochs=MAX_EPOCHS,
     patience=EARLY_STOPPING_PATIENCE,
+    neg_samples=NEG_SAMPLES,
+    val_neg_samples=VAL_NEG_SAMPLES,
     save_model=True,
-    max_train_rows=None,
-    dataset_class=CineIQDataset,
+    dataset_class=CineIQBPRDataset,
     chunk_size=None,
+    rated_history_path=None,
 ):
-    """dataset_class/chunk_size let a caller swap in CineIQIterableDataset
+    """dataset_class/chunk_size let a caller swap in CineIQBPRIterableDataset
     (streamed, chunked pyarrow reads -- for memory-constrained training
-    instances) instead of the default CineIQDataset (loads everything into
-    memory up front) without touching the model/loss/optimizer/eval logic
-    below, which is identical either way."""
-    if save_model and model_output_path is None:
-        raise ValueError("model_output_path is required when save_model=True")
+    instances) instead of the default CineIQBPRDataset (loads all positive
+    interactions into memory up front) without touching the model/loss/
+    optimizer/eval logic below, which is identical either way.
 
+    rated_history_path controls what "the user has never rated" is checked
+    against for negative sampling. Defaults to rl_features.parquet (the
+    fullest available interaction log) if that file exists next to the
+    features directory, else falls back to [train_path, val_path] -- e.g.
+    inside a SageMaker container where only specific channeled files exist.
+    """
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
+    if rated_history_path is None:
+        full_history_path = FEATURES_DIR / "rl_features.parquet"
+        rated_history_path = full_history_path if full_history_path.exists() else [train_path, val_path]
+    print(f"Negative sampling excludes ratings from: {rated_history_path}")
+
     streaming = issubclass(dataset_class, IterableDataset)
-    extra_kwargs = {}
+    extra_kwargs = {"neg_samples": neg_samples}
     if streaming:
         extra_kwargs["batch_size"] = batch_size
         if chunk_size is not None:
             extra_kwargs["chunk_size"] = chunk_size
-    elif max_train_rows is not None:
-        extra_kwargs["max_rows"] = max_train_rows
 
-    print(f"Loading datasets ({'streamed/chunked' if streaming else 'full in-memory'})...")
-    train_dataset = dataset_class(train_path, user_features_path, movie_features_path, **extra_kwargs)
-    val_dataset = dataset_class(
-        val_path,
+    print(f"\nLoading BPR training dataset ({'streamed/chunked' if streaming else 'full in-memory'})...")
+    train_dataset = dataset_class(
+        train_path,
         user_features_path,
         movie_features_path,
-        user_id_map=train_dataset.user_id_map,
-        movie_id_map=train_dataset.movie_id_map,
-        **({"batch_size": batch_size, **({"chunk_size": chunk_size} if chunk_size is not None else {})} if streaming else {}),
+        rated_history_path=rated_history_path,
+        **extra_kwargs,
     )
-    print(f"  train: {len(train_dataset):,} interactions")
-    print(f"  val:   {len(val_dataset):,} interactions")
+    print(f"  {len(train_dataset):,} positive interactions x {neg_samples} negatives/positive")
     print(
         f"  users: {train_dataset.num_users:,}  movies: {train_dataset.num_movies:,}  "
         f"genome_dim: {train_dataset.genome_dim}"
     )
 
     if streaming:
-        # CineIQIterableDataset already yields exactly batch_size-sized
-        # batches and reads sequentially -- batch_size=None tells DataLoader
-        # not to re-batch, and shuffle isn't supported for IterableDataset.
         train_loader = DataLoader(train_dataset, batch_size=None)
-        val_loader = DataLoader(val_dataset, batch_size=None)
     else:
         train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
-        val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
 
     model = NCF(
         num_users=train_dataset.num_users,
@@ -179,48 +209,62 @@ def train_model(
         embedding_dim=embedding_dim,
         genome_dim=train_dataset.genome_dim,
         hidden_layers=hidden_layers,
+        dropout=dropout,
     ).to(device)
 
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
-    criterion = nn.MSELoss()
 
-    history = {"train_loss": [], "val_rmse": [], "val_ndcg": []}
-    best_val_rmse = float("inf")
+    # ------------------------------------------------------------------
+    # Validation ranking-eval setup: negatives sampled once (fixed seed) and
+    # reused every epoch, so metric trajectories reflect model improvement
+    # rather than sampling variance; only the scoring (forward pass) reruns
+    # each epoch against the current weights.
+    # ------------------------------------------------------------------
+    print("\nBuilding validation ranking-eval candidates (negatives fixed across epochs)...")
+    val_positives = pd.read_parquet(val_path, columns=["userId", "movieId"])
+    val_positives["is_positive"] = True
+    val_user_ids = val_positives["userId"].unique()
+
+    val_history = load_rating_history(rated_history_path, val_user_ids)
+    movie_features_full = pd.read_parquet(movie_features_path, columns=["movieId"])
+    catalog = movie_features_full["movieId"].to_numpy()
+    val_negatives = sample_negatives(val_user_ids, val_history, catalog, n_neg=val_neg_samples)
+    val_negatives["is_positive"] = False
+
+    val_candidates_base = pd.concat([val_positives, val_negatives], ignore_index=True)
+    print(f"  {len(val_user_ids):,} val users, {len(val_candidates_base):,} total val candidates")
+
+    # ------------------------------------------------------------------
+    # Training loop
+    # ------------------------------------------------------------------
+    history = {"train_bpr_loss": [], "val_ndcg": [], "val_precision": [], "val_recall": []}
+    best_val_ndcg = -float("inf")
     best_state = None
     epochs_without_improvement = 0
 
     for epoch in range(1, max_epochs + 1):
-        model.train()
-        total_loss = 0.0
-        n_examples = 0
-        for user_idx, movie_idx, genome, rating in train_loader:
-            user_idx, movie_idx, genome, rating = (
-                user_idx.to(device),
-                movie_idx.to(device),
-                genome.to(device),
-                rating.to(device),
-            )
-            optimizer.zero_grad()
-            preds = model(user_idx, movie_idx, genome)
-            loss = criterion(preds, rating)
-            loss.backward()
-            optimizer.step()
-            total_loss += loss.item() * len(rating)
-            n_examples += len(rating)
+        train_loss = train_epoch(model, train_loader, optimizer, device)
 
-        train_loss = total_loss / n_examples
-        val_rmse, val_ndcg = evaluate(model, val_loader, device)
+        val_scored = score_candidates(
+            model, val_candidates_base, train_dataset.user_id_map, train_dataset.movie_id_map,
+            train_dataset.genome_lookup, device,
+        )
+        val_metrics = per_user_ranking_metrics_negsample(val_scored, k=K)
+        val_ndcg = float(val_metrics["ndcg_10"].mean())
+        val_precision = float(val_metrics["precision_10"].mean())
+        val_recall = float(val_metrics["recall_10"].mean(skipna=True))
 
-        history["train_loss"].append(train_loss)
-        history["val_rmse"].append(val_rmse)
+        history["train_bpr_loss"].append(train_loss)
         history["val_ndcg"].append(val_ndcg)
+        history["val_precision"].append(val_precision)
+        history["val_recall"].append(val_recall)
         print(
-            f"Epoch {epoch:3d} | train MSE: {train_loss:.4f} | val RMSE: {val_rmse:.4f} | "
-            f"val NDCG@{NDCG_K}: {val_ndcg:.4f}"
+            f"Epoch {epoch:3d} | BPR loss: {train_loss:.4f} | val NDCG@10: {val_ndcg:.4f} | "
+            f"val Precision@10: {val_precision:.4f} | val Recall@10: {val_recall:.4f}"
         )
 
-        if val_rmse < best_val_rmse - 1e-4:
-            best_val_rmse = val_rmse
+        if val_ndcg > best_val_ndcg + 1e-4:
+            best_val_ndcg = val_ndcg
             epochs_without_improvement = 0
             best_state = {
                 "model_state_dict": model.state_dict(),
@@ -229,16 +273,19 @@ def train_model(
                 "embedding_dim": embedding_dim,
                 "genome_dim": train_dataset.genome_dim,
                 "hidden_layers": list(hidden_layers),
+                "dropout": dropout,
                 "user_id_map": train_dataset.user_id_map,
                 "movie_id_map": train_dataset.movie_id_map,
                 "epoch": epoch,
-                "val_rmse": val_rmse,
+                "train_bpr_loss": train_loss,
                 "val_ndcg": val_ndcg,
+                "val_precision": val_precision,
+                "val_recall": val_recall,
             }
         else:
             epochs_without_improvement += 1
             if epochs_without_improvement >= patience:
-                print(f"Early stopping at epoch {epoch} (no val RMSE improvement for {patience} epochs)")
+                print(f"Early stopping at epoch {epoch} (no val NDCG@10 improvement for {patience} epochs)")
                 break
 
     if save_model:
@@ -246,14 +293,13 @@ def train_model(
         model_output_path.parent.mkdir(parents=True, exist_ok=True)
         torch.save(best_state, model_output_path)
         print(
-            f"Saved best model (epoch {best_state['epoch']}, val RMSE {best_state['val_rmse']:.4f}, "
-            f"val NDCG@{NDCG_K} {best_state['val_ndcg']:.4f}) -> {model_output_path}"
+            f"Saved best model (epoch {best_state['epoch']}, val NDCG@10 {best_state['val_ndcg']:.4f}, "
+            f"val Precision@10 {best_state['val_precision']:.4f}) -> {model_output_path}"
         )
     else:
         print(
             f"save_model=False -- skipping checkpoint save "
-            f"(best epoch {best_state['epoch']}, val RMSE {best_state['val_rmse']:.4f}, "
-            f"val NDCG@{NDCG_K} {best_state['val_ndcg']:.4f})"
+            f"(best epoch {best_state['epoch']}, val NDCG@10 {best_state['val_ndcg']:.4f})"
         )
 
     if figures_dir is not None:
