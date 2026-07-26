@@ -23,6 +23,18 @@ and falls back to excluding whatever the train + val channels alone show,
 which is what train_model()'s rated_history_path=None default already does
 automatically; no extra channel is needed.
 
+Checkpointing: if launch_sagemaker.py's CheckpointConfig is set (S3Uri +
+LocalPath), SageMaker syncs LocalPath with S3 both ways -- on startup it
+downloads whatever's already in S3Uri into LocalPath (e.g. from a previous,
+interrupted attempt at this job), and during/after training it uploads
+whatever gets written to LocalPath back to S3Uri. This script always passes
+<checkpoint_local_path>/best_model.pt to train_model() as both
+resume_from_checkpoint and extra_checkpoint_paths: if that file is already
+there at startup (a prior attempt got at least one epoch in), train_model()
+loads it and resumes from the next epoch instead of starting over; either
+way, every time a new best is found it's saved there (in addition to
+/opt/ml/model/recommender_model.pt) so progress survives an interruption.
+
 Expects four data channels passed to Estimator.fit({...}) (matches
 launch_sagemaker.py's four-channel job config):
   train          -> rec_train.parquet
@@ -65,6 +77,12 @@ def parse_args():
     parser.add_argument(
         "--chunk_size", type=int, default=500_000, help="Rows read per pyarrow batch while streaming"
     )
+    parser.add_argument(
+        "--checkpoint_local_path",
+        type=str,
+        default=os.environ.get("SM_CHECKPOINT_LOCAL_PATH", "/opt/ml/checkpoints"),
+        help="Must match launch_sagemaker.py's CheckpointConfig LocalPath -- SageMaker syncs this with S3",
+    )
 
     # Data channels -- default to the SM_CHANNEL_* env vars SageMaker sets;
     # fall back to the raw /opt/ml/input/data/<channel> path so this still
@@ -100,18 +118,26 @@ def main():
     user_features_channel = Path(args.user_features_channel)
     movie_features_channel = Path(args.movie_features_channel)
     model_dir = Path(args.model_dir)
+    checkpoint_dir = Path(args.checkpoint_local_path)
+    checkpoint_path = checkpoint_dir / "best_model.pt"
 
     print(f"train_channel:          {train_channel}")
     print(f"val_channel:            {val_channel}")
     print(f"user_features_channel:  {user_features_channel}")
     print(f"movie_features_channel: {movie_features_channel}")
     print(f"model_dir:              {model_dir}")
+    print(f"checkpoint_local_path:  {checkpoint_dir}")
     print(
         f"hyperparameters:  embedding_dim={args.embedding_dim}  lr={args.lr}  "
         f"batch_size={args.batch_size}  hidden_layers={hidden_layers}  dropout={args.dropout}  "
         f"neg_samples={args.neg_samples}  val_neg_samples={args.val_neg_samples}  "
         f"max_epochs={args.max_epochs}  patience={args.patience}  chunk_size={args.chunk_size}"
     )
+
+    if checkpoint_path.exists():
+        print(f"\n{checkpoint_path} exists -- will resume training from it.")
+    else:
+        print(f"\nNo checkpoint at {checkpoint_path} -- starting from scratch.")
 
     train_model(
         train_path=train_channel / "rec_train.parquet",
@@ -131,6 +157,8 @@ def main():
         val_neg_samples=args.val_neg_samples,
         dataset_class=CineIQBPRIterableDataset,
         chunk_size=args.chunk_size,
+        resume_from_checkpoint=checkpoint_path,
+        extra_checkpoint_paths=[checkpoint_path],
     )
 
 

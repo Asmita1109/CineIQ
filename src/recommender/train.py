@@ -156,6 +156,8 @@ def train_model(
     dataset_class=CineIQBPRDataset,
     chunk_size=None,
     rated_history_path=None,
+    resume_from_checkpoint=None,
+    extra_checkpoint_paths=None,
 ):
     """dataset_class/chunk_size let a caller swap in CineIQBPRIterableDataset
     (streamed, chunked pyarrow reads -- for memory-constrained training
@@ -168,9 +170,50 @@ def train_model(
     fullest available interaction log) if that file exists next to the
     features directory, else falls back to [train_path, val_path] -- e.g.
     inside a SageMaker container where only specific channeled files exist.
+
+    resume_from_checkpoint: path to a previously-saved checkpoint. If it
+    exists, model/optimizer state and the epoch/best-NDCG counters resume
+    from it instead of starting fresh -- e.g. after a SageMaker Spot
+    interruption or a manual job restart. Architecture params
+    (embedding_dim/hidden_layers/dropout) are taken from the checkpoint
+    itself so the resumed weights stay consistent, even if the caller passed
+    different values.
+
+    extra_checkpoint_paths: additional path(s) to also save to every time a
+    new best (by val NDCG@10) is found, alongside model_output_path --
+    e.g. SageMaker's CheckpointConfig LocalPath, so progress survives an
+    interruption instead of only being written once at the very end.
     """
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
+
+    resume_ckpt = None
+    resumed_epoch_start = 1
+    resumed_best_val_ndcg = -float("inf")
+    checkpoint_id_maps = {}
+    if resume_from_checkpoint is not None:
+        resume_from_checkpoint = Path(resume_from_checkpoint)
+        if resume_from_checkpoint.exists():
+            print(f"\nFound checkpoint at {resume_from_checkpoint} -- resuming training.")
+            resume_ckpt = torch.load(resume_from_checkpoint, map_location=device, weights_only=False)
+            resumed_epoch_start = resume_ckpt["epoch"] + 1
+            resumed_best_val_ndcg = resume_ckpt["val_ndcg"]
+            embedding_dim = resume_ckpt["embedding_dim"]
+            hidden_layers = tuple(resume_ckpt["hidden_layers"])
+            dropout = resume_ckpt.get("dropout", dropout)
+            checkpoint_id_maps = {
+                "user_id_map": resume_ckpt["user_id_map"],
+                "movie_id_map": resume_ckpt["movie_id_map"],
+            }
+            print(f"  Resuming from epoch {resume_ckpt['epoch']} -> next epoch is {resumed_epoch_start}")
+            print(f"  Best val NDCG@10 so far: {resumed_best_val_ndcg:.4f}")
+            if resumed_epoch_start > max_epochs:
+                print(
+                    f"  Warning: resumed epoch {resumed_epoch_start} already exceeds max_epochs={max_epochs} "
+                    f"-- no further training will run."
+                )
+        else:
+            print(f"\nNo checkpoint found at {resume_from_checkpoint} -- starting from scratch.")
 
     if rated_history_path is None:
         full_history_path = FEATURES_DIR / "rl_features.parquet"
@@ -178,7 +221,7 @@ def train_model(
     print(f"Negative sampling excludes ratings from: {rated_history_path}")
 
     streaming = issubclass(dataset_class, IterableDataset)
-    extra_kwargs = {"neg_samples": neg_samples}
+    extra_kwargs = {"neg_samples": neg_samples, **checkpoint_id_maps}
     if streaming:
         extra_kwargs["batch_size"] = batch_size
         if chunk_size is not None:
@@ -214,6 +257,13 @@ def train_model(
 
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
 
+    if resume_ckpt is not None:
+        model.load_state_dict(resume_ckpt["model_state_dict"])
+        if "optimizer_state_dict" in resume_ckpt:
+            optimizer.load_state_dict(resume_ckpt["optimizer_state_dict"])
+        else:
+            print("  Checkpoint has no optimizer_state_dict (older format) -- optimizer starts fresh.")
+
     # ------------------------------------------------------------------
     # Validation ranking-eval setup: negatives sampled once (fixed seed) and
     # reused every epoch, so metric trajectories reflect model improvement
@@ -235,14 +285,27 @@ def train_model(
     print(f"  {len(val_user_ids):,} val users, {len(val_candidates_base):,} total val candidates")
 
     # ------------------------------------------------------------------
-    # Training loop
+    # Training loop -- saves to every checkpoint path immediately whenever a
+    # new best is found (not just once at the end), so progress survives an
+    # interruption (e.g. a SageMaker Spot reclaim) instead of being lost.
     # ------------------------------------------------------------------
+    checkpoint_paths = []
+    if save_model:
+        if model_output_path is None:
+            raise ValueError("model_output_path is required when save_model=True")
+        checkpoint_paths.append(Path(model_output_path))
+    if extra_checkpoint_paths:
+        checkpoint_paths.extend(Path(p) for p in extra_checkpoint_paths)
+
     history = {"train_bpr_loss": [], "val_ndcg": [], "val_precision": [], "val_recall": []}
-    best_val_ndcg = -float("inf")
+    best_val_ndcg = resumed_best_val_ndcg
     best_state = None
     epochs_without_improvement = 0
 
-    for epoch in range(1, max_epochs + 1):
+    if resumed_epoch_start > max_epochs:
+        return resume_ckpt, history
+
+    for epoch in range(resumed_epoch_start, max_epochs + 1):
         train_loss = train_epoch(model, train_loader, optimizer, device)
 
         val_scored = score_candidates(
@@ -268,6 +331,7 @@ def train_model(
             epochs_without_improvement = 0
             best_state = {
                 "model_state_dict": model.state_dict(),
+                "optimizer_state_dict": optimizer.state_dict(),
                 "num_users": train_dataset.num_users,
                 "num_movies": train_dataset.num_movies,
                 "embedding_dim": embedding_dim,
@@ -282,23 +346,25 @@ def train_model(
                 "val_precision": val_precision,
                 "val_recall": val_recall,
             }
+            for p in checkpoint_paths:
+                p.parent.mkdir(parents=True, exist_ok=True)
+                torch.save(best_state, p)
+                print(f"  New best model (val NDCG@10 {val_ndcg:.4f}) -- checkpoint saved -> {p}")
         else:
             epochs_without_improvement += 1
             if epochs_without_improvement >= patience:
                 print(f"Early stopping at epoch {epoch} (no val NDCG@10 improvement for {patience} epochs)")
                 break
 
-    if save_model:
-        model_output_path = Path(model_output_path)
-        model_output_path.parent.mkdir(parents=True, exist_ok=True)
-        torch.save(best_state, model_output_path)
+    if best_state is None:
+        if resume_ckpt is not None:
+            print("No epoch improved on the resumed checkpoint's val NDCG@10 -- it remains the best model.")
+            best_state = resume_ckpt
+        else:
+            print("Warning: no epoch improved val NDCG@10 -- nothing was saved.")
+    elif not checkpoint_paths:
         print(
-            f"Saved best model (epoch {best_state['epoch']}, val NDCG@10 {best_state['val_ndcg']:.4f}, "
-            f"val Precision@10 {best_state['val_precision']:.4f}) -> {model_output_path}"
-        )
-    else:
-        print(
-            f"save_model=False -- skipping checkpoint save "
+            f"save_model=False and no extra_checkpoint_paths -- no checkpoint was saved "
             f"(best epoch {best_state['epoch']}, val NDCG@10 {best_state['val_ndcg']:.4f})"
         )
 

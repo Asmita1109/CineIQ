@@ -27,11 +27,17 @@ REGION = "us-east-1"
 S3_BUCKET = "cineiq-ml-bucket"
 S3_FEATURES_PREFIX = f"s3://{S3_BUCKET}/features/"
 S3_OUTPUT_PATH = f"s3://{S3_BUCKET}/models/recommender/"
+S3_CHECKPOINT_URI = f"s3://{S3_BUCKET}/checkpoints/recommender/"
+CHECKPOINT_LOCAL_PATH = "/opt/ml/checkpoints/"
 
 INSTANCE_TYPE = "ml.m5.2xlarge"
 INSTANCE_COUNT = 1
 VOLUME_SIZE_GB = 30
-MAX_RUNTIME_SECONDS = 24 * 60 * 60  # 24h safety cap so a stuck job can't run (and bill) forever
+# 3-day safety cap, not an expected runtime -- with CheckpointConfig wired up,
+# a job that gets interrupted (Spot reclaim, manual stop) can be relaunched
+# and will resume from its last checkpoint rather than starting over, so this
+# just bounds worst-case cost/duration across however many relaunches that takes.
+MAX_RUNTIME_SECONDS = 259200
 
 # AWS's Deep Learning Containers account (763104351884) is the same across
 # every AWS account and most regions -- it's not specific to this project.
@@ -51,6 +57,7 @@ HYPERPARAMETERS = {
     "max_epochs": "30",
     "patience": "7",
     "neg_samples": "4",
+    "checkpoint_local_path": CHECKPOINT_LOCAL_PATH.rstrip("/"),  # must match CheckpointConfig's LocalPath below
 }
 
 # CloudWatch parses these regexes out of the training container's stdout
@@ -186,6 +193,7 @@ def build_job_config(job_name, role_arn, hyperparameters):
             "InstanceCount": INSTANCE_COUNT,
             "VolumeSizeInGB": VOLUME_SIZE_GB,
         },
+        "CheckpointConfig": {"S3Uri": S3_CHECKPOINT_URI, "LocalPath": CHECKPOINT_LOCAL_PATH},
         "StoppingCondition": {"MaxRuntimeInSeconds": MAX_RUNTIME_SECONDS},
         "HyperParameters": hyperparameters,
     }
@@ -215,6 +223,8 @@ def main():
     print(f"Instance:        {INSTANCE_TYPE} x{INSTANCE_COUNT}, {VOLUME_SIZE_GB}GB volume")
     print(f"Input channels:  train, val, user_features, movie_features -> {S3_FEATURES_PREFIX}")
     print(f"Output path:     {S3_OUTPUT_PATH}")
+    print(f"Checkpoint S3:   {S3_CHECKPOINT_URI}  <-> local {CHECKPOINT_LOCAL_PATH}")
+    print(f"Max runtime:     {MAX_RUNTIME_SECONDS:,}s ({MAX_RUNTIME_SECONDS / 86400:.1f} days)")
     print("Hyperparameters:")
     for k, v in HYPERPARAMETERS.items():
         print(f"  {k} = {v}")
