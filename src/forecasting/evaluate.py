@@ -1,6 +1,7 @@
 """Evaluate the trained forecasting model on the held-out test set and
 compare against validation performance to check for overfitting."""
 
+import json
 import pickle
 from pathlib import Path
 
@@ -12,12 +13,6 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 DATA_DIR = PROJECT_ROOT / "data"
 FEATURES_DIR = DATA_DIR / "features"
 MODELS_DIR = PROJECT_ROOT / "models"
-
-# From the training run (src/forecasting/train.py), for comparison.
-VAL_BASELINE_RMSE = 1272.386
-VAL_BASELINE_MAE = 738.763
-VAL_MODEL_RMSE = 271.185
-VAL_MODEL_MAE = 149.959
 
 
 def rmse(y_true, y_pred):
@@ -38,6 +33,15 @@ def main():
     model = bundle["model"]
     genre_encoder = bundle["genre_encoder"]
     feature_cols = bundle["feature_cols"]
+
+    results_path = MODELS_DIR / "forecasting_results.json"
+    print(f"Loading val metrics from {results_path}")
+    with open(results_path) as f:
+        train_results = json.load(f)
+    val_baseline_rmse = train_results["val"]["baseline_rmse"]
+    val_baseline_mae = train_results["val"]["baseline_mae"]
+    val_model_rmse = train_results["val"]["lightgbm_rmse"]
+    val_model_mae = train_results["val"]["lightgbm_mae"]
 
     test = pd.read_csv(FEATURES_DIR / "forecasting_test.csv")
     print(f"forecasting_test.csv: {test.shape}")
@@ -65,16 +69,16 @@ def main():
     comparison = pd.DataFrame(
         {
             "Split": ["Validation", "Test"],
-            "Baseline RMSE": [round(VAL_BASELINE_RMSE, 3), round(baseline_rmse, 3)],
-            "Baseline MAE": [round(VAL_BASELINE_MAE, 3), round(baseline_mae, 3)],
-            "LightGBM RMSE": [round(VAL_MODEL_RMSE, 3), round(model_rmse, 3)],
-            "LightGBM MAE": [round(VAL_MODEL_MAE, 3), round(model_mae, 3)],
+            "Baseline RMSE": [round(val_baseline_rmse, 3), round(baseline_rmse, 3)],
+            "Baseline MAE": [round(val_baseline_mae, 3), round(baseline_mae, 3)],
+            "LightGBM RMSE": [round(val_model_rmse, 3), round(model_rmse, 3)],
+            "LightGBM MAE": [round(val_model_mae, 3), round(model_mae, 3)],
         }
     )
     print(comparison.to_string(index=False))
 
-    rmse_gap_pct = (model_rmse - VAL_MODEL_RMSE) / VAL_MODEL_RMSE * 100
-    mae_gap_pct = (model_mae - VAL_MODEL_MAE) / VAL_MODEL_MAE * 100
+    rmse_gap_pct = (model_rmse - val_model_rmse) / val_model_rmse * 100
+    mae_gap_pct = (model_mae - val_model_mae) / val_model_mae * 100
     print(f"\nTest vs val RMSE gap: {rmse_gap_pct:+.1f}%  (positive = test worse than val)")
     print(f"Test vs val MAE gap:  {mae_gap_pct:+.1f}%  (positive = test worse than val)")
 
@@ -99,7 +103,7 @@ def main():
         )
 
     print(
-        f"\nRelative improvement over baseline -- val: {(VAL_BASELINE_RMSE - VAL_MODEL_RMSE) / VAL_BASELINE_RMSE * 100:.1f}%, "
+        f"\nRelative improvement over baseline -- val: {(val_baseline_rmse - val_model_rmse) / val_baseline_rmse * 100:.1f}%, "
         f"test: {rmse_improvement:.1f}% (a more robust generalization signal than raw RMSE, "
         f"since it's not sensitive to each period's underlying rating volume)"
     )

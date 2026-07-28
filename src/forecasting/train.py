@@ -4,6 +4,7 @@ Compares against a naive "next week = last week" baseline so LightGBM has to
 earn its complexity, not just beat a strawman.
 """
 
+import json
 import pickle
 from pathlib import Path
 
@@ -45,16 +46,19 @@ PALETTE = "mako"
 def load_data():
     train = pd.read_csv(FEATURES_DIR / "forecasting_train.csv")
     val = pd.read_csv(FEATURES_DIR / "forecasting_val.csv")
-    return train, val
+    test = pd.read_csv(FEATURES_DIR / "forecasting_test.csv")
+    return train, val, test
 
 
-def encode_genre(train, val):
+def encode_genre(train, val, test):
     encoder = LabelEncoder()
     train = train.copy()
     val = val.copy()
+    test = test.copy()
     train["genre_encoded"] = encoder.fit_transform(train["genre"])
     val["genre_encoded"] = encoder.transform(val["genre"])
-    return train, val, encoder
+    test["genre_encoded"] = encoder.transform(test["genre"])
+    return train, val, test, encoder
 
 
 def rmse(y_true, y_pred):
@@ -125,15 +129,17 @@ def main():
     plt.rcParams["figure.dpi"] = 100
     plt.rcParams["savefig.dpi"] = 150
 
-    print("Loading forecasting_train.csv / forecasting_val.csv ...")
-    train, val = load_data()
+    print("Loading forecasting_train.csv / forecasting_val.csv / forecasting_test.csv ...")
+    train, val, test = load_data()
     print(f"  train: {train.shape}")
     print(f"  val:   {val.shape}")
+    print(f"  test:  {test.shape}")
 
-    train, val, genre_encoder = encode_genre(train, val)
+    train, val, test, genre_encoder = encode_genre(train, val, test)
 
     X_train, y_train = train[FEATURE_COLS], train[TARGET_COL]
     X_val, y_val = val[FEATURE_COLS], val[TARGET_COL]
+    X_test, y_test = test[FEATURE_COLS], test[TARGET_COL]
 
     # ------------------------------------------------------------------
     # 3. Naive baseline: predict next week = last week (lag_1)
@@ -178,8 +184,8 @@ def main():
     val_preds = np.clip(val_preds, 0, None)  # rating counts can't be negative
     model_rmse, model_mae = evaluate(y_val, val_preds, "LightGBM")
 
-    rmse_improvement = (baseline_rmse - model_rmse) / baseline_rmse * 100
-    mae_improvement = (baseline_mae - model_mae) / baseline_mae * 100
+    val_rmse_improvement = (baseline_rmse - model_rmse) / baseline_rmse * 100
+    val_mae_improvement = (baseline_mae - model_mae) / baseline_mae * 100
 
     summary = pd.DataFrame(
         {
@@ -189,8 +195,26 @@ def main():
         }
     )
     print("\n" + summary.to_string(index=False))
-    print(f"\nRMSE improvement over baseline: {rmse_improvement:+.1f}%")
-    print(f"MAE improvement over baseline:  {mae_improvement:+.1f}%")
+    print(f"\nRMSE improvement over baseline: {val_rmse_improvement:+.1f}%")
+    print(f"MAE improvement over baseline:  {val_mae_improvement:+.1f}%")
+
+    # ------------------------------------------------------------------
+    # 5b. Evaluate on the held-out test set too
+    # ------------------------------------------------------------------
+    print("\n" + "=" * 70)
+    print("TEST SET EVALUATION")
+    print("=" * 70)
+    test_baseline_preds = test["lag_1"].fillna(0)
+    test_baseline_rmse, test_baseline_mae = evaluate(y_test, test_baseline_preds, "Baseline (lag_1)")
+
+    test_preds = model.predict(X_test, num_iteration=model.best_iteration)
+    test_preds = np.clip(test_preds, 0, None)
+    test_model_rmse, test_model_mae = evaluate(y_test, test_preds, "LightGBM")
+
+    test_rmse_improvement = (test_baseline_rmse - test_model_rmse) / test_baseline_rmse * 100
+    test_mae_improvement = (test_baseline_mae - test_model_mae) / test_baseline_mae * 100
+    print(f"\nRMSE improvement over baseline: {test_rmse_improvement:+.1f}%")
+    print(f"MAE improvement over baseline:  {test_mae_improvement:+.1f}%")
 
     # ------------------------------------------------------------------
     # 6. Plots
@@ -210,14 +234,42 @@ def main():
     print(f"\nSaved -> {model_path}")
 
     # ------------------------------------------------------------------
-    # 8. Final summary
+    # 8. Save results
+    # ------------------------------------------------------------------
+    results = {
+        "best_iteration": model.best_iteration,
+        "feature_cols": FEATURE_COLS,
+        "n_rows": {"train": len(train), "val": len(val), "test": len(test)},
+        "val": {
+            "baseline_rmse": round(baseline_rmse, 3),
+            "baseline_mae": round(baseline_mae, 3),
+            "lightgbm_rmse": round(model_rmse, 3),
+            "lightgbm_mae": round(model_mae, 3),
+            "rmse_improvement_pct": round(val_rmse_improvement, 1),
+            "mae_improvement_pct": round(val_mae_improvement, 1),
+        },
+        "test": {
+            "baseline_rmse": round(test_baseline_rmse, 3),
+            "baseline_mae": round(test_baseline_mae, 3),
+            "lightgbm_rmse": round(test_model_rmse, 3),
+            "lightgbm_mae": round(test_model_mae, 3),
+            "rmse_improvement_pct": round(test_rmse_improvement, 1),
+            "mae_improvement_pct": round(test_mae_improvement, 1),
+        },
+    }
+    results_path = MODELS_DIR / "forecasting_results.json"
+    with open(results_path, "w") as f:
+        json.dump(results, f, indent=2)
+    print(f"Saved -> {results_path}")
+
+    # ------------------------------------------------------------------
+    # 9. Final summary
     # ------------------------------------------------------------------
     print("\n" + "=" * 70)
     print("FINAL SUMMARY")
     print("=" * 70)
-    print(f"Baseline RMSE:  {baseline_rmse:.3f}")
-    print(f"LightGBM RMSE:  {model_rmse:.3f}")
-    print(f"Improvement:    {rmse_improvement:+.1f}%")
+    print(f"Val   -- Baseline RMSE: {baseline_rmse:.3f}   LightGBM RMSE: {model_rmse:.3f}   Improvement: {val_rmse_improvement:+.1f}%")
+    print(f"Test  -- Baseline RMSE: {test_baseline_rmse:.3f}   LightGBM RMSE: {test_model_rmse:.3f}   Improvement: {test_rmse_improvement:+.1f}%")
 
 
 if __name__ == "__main__":

@@ -1,0 +1,115 @@
+{
+  "forecasting": {
+    "best_iteration": 392,
+    "n_rows": {
+      "train": 22629,
+      "val": 2831,
+      "test": 2831
+    },
+    "val": {
+      "baseline_rmse": 1272.386,
+      "baseline_mae": 738.763,
+      "lightgbm_rmse": 271.185,
+      "lightgbm_mae": 149.959,
+      "rmse_improvement_pct": 78.7,
+      "mae_improvement_pct": 79.7
+    },
+    "test": {
+      "baseline_rmse": 1006.672,
+      "baseline_mae": 575.016,
+      "lightgbm_rmse": 180.774,
+      "lightgbm_mae": 116.052,
+      "rmse_improvement_pct": 82.0,
+      "mae_improvement_pct": 79.8
+    }
+  },
+  "recommender": {
+    "ncf_v2_pointwise_training": {
+      "job_name": "cineiq-recommender-20260724-175332",
+      "job_status": "Completed",
+      "hyperparameters": {
+        "batch_size": "1024",
+        "embedding_dim": "32",
+        "lr": "0.001",
+        "max_epochs": "20",
+        "patience": "5",
+        "sagemaker_program": "sagemaker_train.py",
+        "sagemaker_submit_directory": "s3://cineiq-ml-bucket/code/cineiq-recommender-20260724-175332/source.tar.gz"
+      },
+      "n_epochs_logged": 7,
+      "best_epoch": {
+        "epoch": 2,
+        "train_mse": 0.9282,
+        "val_rmse": 1.0227,
+        "val_ndcg_10": 0.9604
+      }
+    },
+    "ncf_v3_bpr_test_evaluation": {
+      "checkpoint_epoch": 30,
+      "val_metrics": {
+        "ndcg_10": 0.8187208095605483,
+        "precision_10": 0.4526746640580755,
+        "recall_10": 0.905349328116151
+      },
+      "test_metrics": {
+        "ndcg_10": 0.7998559905136766,
+        "precision_10": 0.4420363192386052,
+        "recall_10": 0.8840726384772104,
+        "n_users": 271923
+      },
+      "methodology": {
+        "n_negatives_per_user": 100,
+        "k": 10,
+        "relevance": "binary (real held-out movie vs. sampled negative)",
+        "scoring": "raw NCF relevance score (Version 3 BPR model, no rating scale)"
+      },
+      "ranking_metrics_by_user_segment": {
+        "casual": {
+          "ndcg_10": 0.7554682256123466,
+          "precision_10": 0.43058430535019987,
+          "recall_10": 0.8611686107003997,
+          "n_users": 73044
+        },
+        "power": {
+          "ndcg_10": 0.7794451871073192,
+          "precision_10": 0.4321572257188695,
+          "recall_10": 0.864314451437739,
+          "n_users": 81030
+        },
+        "regular": {
+          "ndcg_10": 0.841402281494176,
+          "precision_10": 0.45592712646799266,
+          "recall_10": 0.9118542529359853,
+          "n_users": 117848
+        }
+      },
+      "ndcg_10_by_top_genres": {
+        "Drama": {
+          "ndcg_10": 0.800593546072041,
+          "n_users": 246264
+        },
+        "Comedy": {
+          "ndcg_10": 0.7975104552382151,
+          "n_users": 220761
+        },
+        "Thriller": {
+          "ndcg_10": 0.8131967147800288,
+          "n_users": 194957
+        },
+        "Action": {
+          "ndcg_10": 0.8202244600817947,
+          "n_users": 195232
+        },
+        "Romance": {
+          "ndcg_10": 0.8011193671110177,
+          "n_users": 160054
+        }
+      }
+    }
+  },
+  "sources": {
+    "forecasting_results": "models\\forecasting_results.json",
+    "training_results": "models\\training_results.json",
+    "bpr_test_results": "models\\recommender_test_results_bpr.json"
+  }
+}
