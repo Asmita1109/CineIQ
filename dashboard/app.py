@@ -391,29 +391,6 @@ st.plotly_chart(fig, width="stretch", config={"displayModeBar": False, "scrollZo
 # ------------------------------------------------------------------
 st.header("Get Personalized Recommendations")
 
-# TEMPORARY debug output for the Streamlit Cloud "crashes loading
-# recommendations, works locally" investigation -- remove once resolved.
-st.write("DEBUG: Starting recommendations")
-st.write(f"DEBUG: MODELS_DIR = {MODELS_DIR}")
-st.write(f"DEBUG: MODELS_DIR exists = {MODELS_DIR.exists()}")
-st.write(f"DEBUG: recommender_model_bpr.pt exists = {(MODELS_DIR / 'recommender_model_bpr.pt').exists()}")
-st.write(f"DEBUG: sys.path = {sys.path}")
-
-with st.expander("Diagnostics (paths + file status)", expanded=True):
-    st.write(f"PROJECT_ROOT: `{PROJECT_ROOT}`")
-    st.write(f"MODELS_DIR: `{MODELS_DIR}` (exists: {MODELS_DIR.exists()})")
-    st.write(f"FEATURES_DIR: `{FEATURES_DIR}` (exists: {FEATURES_DIR.exists()})")
-    st.write(f"PROCESSED_DIR: `{PROCESSED_DIR}` (exists: {PROCESSED_DIR.exists()})")
-    bpr_path = MODELS_DIR / "recommender_model_bpr.pt"
-    bpr_size = f"{bpr_path.stat().st_size:,} bytes" if bpr_path.exists() else "MISSING"
-    st.write(f"BPR checkpoint: `{bpr_path}` ({bpr_size})")
-    rl_path = FEATURES_DIR / "rl_features.parquet"
-    rl_size = f"{rl_path.stat().st_size:,} bytes" if rl_path.exists() else "MISSING"
-    st.write(f"rl_features.parquet: `{rl_path}` ({rl_size})")
-    tags_path = PROCESSED_DIR / "movie_top_tags.csv"
-    tags_size = f"{tags_path.stat().st_size:,} bytes" if tags_path.exists() else "MISSING"
-    st.write(f"movie_top_tags.csv: `{tags_path}` ({tags_size})")
-
 # TEMPORARY: wrap the whole loading sequence so a crash here shows the full
 # traceback on-page instead of Cloud just dying silently / showing its
 # generic error screen. st.stop() after displaying it, since letting
