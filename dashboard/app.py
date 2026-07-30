@@ -23,6 +23,31 @@ import plotly.graph_objects as go
 import streamlit as st
 import torch
 
+# TEMPORARY: force stdout to flush after every line. A prior deploy
+# crashed with NO error message shown on-page at all -- if that's an
+# external kill (OOM, container resource limit) rather than a Python
+# exception, our own try/except can't catch it (the interpreter itself
+# gets terminated), and print() calls are only useful for pinpointing
+# *where* it died if they've actually reached the log before the kill.
+# Default stdout buffering when not attached to a terminal (as on Cloud)
+# can hold lines in memory rather than writing them immediately, which
+# would silently lose exactly the diagnostic info we need most.
+sys.stdout.reconfigure(line_buffering=True)
+
+
+def log_mem(tag):
+    """Logs current process RSS memory. Uses the `resource` module (Linux
+    only, which is what Streamlit Cloud runs) to actually measure this --
+    on Windows (local dev) it just no-ops rather than guessing."""
+    try:
+        import resource
+
+        rss_mb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
+        print(f"[mem] {tag}: RSS = {rss_mb:,.0f} MB")
+    except ImportError:
+        pass
+
+
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DATA_DIR = PROJECT_ROOT / "data"
 FEATURES_DIR = DATA_DIR / "features"
@@ -36,6 +61,7 @@ print(f"[paths] PROJECT_ROOT={PROJECT_ROOT}")
 print(f"[paths] FEATURES_DIR={FEATURES_DIR}")
 print(f"[paths] PROCESSED_DIR={PROCESSED_DIR}")
 print(f"[paths] MODELS_DIR={MODELS_DIR}")
+log_mem("app start")
 
 # dashboard/ is a sibling of src/ -- add the specific package dirs we need
 # so bare imports (matching those modules' own same-directory convention)
@@ -158,6 +184,7 @@ def setup_required_files():
             st.stop()
     st.write("Setup complete.")
     print("[setup] setup_required_files() complete -- all required files present.")
+    log_mem("after setup_required_files")
 
 
 st.set_page_config(page_title="CineIQ", page_icon="\U0001f3ac", layout="wide")
@@ -191,7 +218,9 @@ def load_movie_catalog():
 def load_bpr_model():
     ckpt_path = MODELS_DIR / "recommender_model_bpr.pt"
     print(f"[recs] load_bpr_model: torch.load({ckpt_path}) exists={ckpt_path.exists()} ...")
+    log_mem("before torch.load BPR checkpoint")
     ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+    log_mem("after torch.load BPR checkpoint")
     print("[recs] load_bpr_model: checkpoint loaded, building NCF model ...")
     model = NCF(
         num_users=ckpt["num_users"],
@@ -206,6 +235,7 @@ def load_bpr_model():
     movie_features = pd.read_parquet(FEATURES_DIR / "movie_features.parquet")
     genome_lookup = build_genome_lookup(movie_features, ckpt["movie_id_map"], ckpt["genome_dim"])
     print("[recs] load_bpr_model: done.")
+    log_mem("after load_bpr_model")
     return model, ckpt, genome_lookup
 
 
@@ -216,7 +246,9 @@ def load_rated_movie_sets(_user_id_map, _movie_id_map):
     # identity matters for cache validity here, it only ever runs once.
     rl_path = FEATURES_DIR / "rl_features.parquet"
     print(f"[recs] load_rated_movie_sets: reading {rl_path} exists={rl_path.exists()} ...")
+    log_mem("before _build_user_rated_sets (33.7M-row rl_features.parquet)")
     result = _build_user_rated_sets(rl_path, _user_id_map, _movie_id_map)
+    log_mem("after _build_user_rated_sets")
     print("[recs] load_rated_movie_sets: done.")
     return result
 
@@ -297,7 +329,9 @@ st.markdown(
 st.markdown("<h3>\U0001f525 Genre Trends</h3>", unsafe_allow_html=True, anchors=False)
 st.caption("28 years of genre popularity trends")
 
+log_mem("before load_forecasting_features")
 forecasting_df = load_forecasting_features()
+log_mem("after load_forecasting_features")
 
 top_genres = (
     forecasting_df.groupby("genre")["rating_count"].sum().nlargest(TOP_N_GENRES).index.tolist()
@@ -377,12 +411,16 @@ with st.expander("Diagnostics (paths + file status)", expanded=True):
 try:
     print("[recs] Loading user_features.parquet ...")
     user_features = load_user_features()
+    log_mem("after load_user_features")
     print("[recs] Loading movie_catalog (movie_features.parquet + movies_clean.csv) ...")
     movie_catalog = load_movie_catalog()
+    log_mem("after load_movie_catalog")
     print("[recs] Loading BPR model ...")
     bpr_model, bpr_ckpt, genome_lookup = load_bpr_model()
+    log_mem("after load_bpr_model (cached call)")
     print("[recs] Loading rated_movie_sets (rl_features.parquet) ...")
     rated_sets = load_rated_movie_sets(bpr_ckpt["user_id_map"], bpr_ckpt["movie_id_map"])
+    log_mem("after load_rated_movie_sets (cached call)")
     print("[recs] All recommendation dependencies loaded successfully.")
 except Exception as e:
     import traceback
@@ -423,7 +461,19 @@ if clicked_get_recommendations or first_load:
     else:
         with st.spinner("Scoring movies..."):
             profile = profile_row.iloc[0].to_dict()
-            recs = score_top_movies(user_id, bpr_model, bpr_ckpt, genome_lookup, rated_sets, movie_catalog)
+            try:
+                print(f"[recs] score_top_movies for user {user_id} ...")
+                log_mem("before score_top_movies")
+                recs = score_top_movies(user_id, bpr_model, bpr_ckpt, genome_lookup, rated_sets, movie_catalog)
+                log_mem("after score_top_movies")
+                print("[recs] score_top_movies done.")
+            except Exception as e:
+                import traceback
+
+                print(f"[recs] score_top_movies FAILED: {type(e).__name__}: {e}")
+                st.error(f"Error scoring movies: {e}")
+                st.code(traceback.format_exc())
+                st.stop()
 
         if recs is None or recs.empty:
             st.session_state.rec_result = {
@@ -435,7 +485,9 @@ if clicked_get_recommendations or first_load:
             with st.spinner("Generating explanation..."):
                 try:
                     print("[recs] Loading explainer (genome_scores_clean.csv, ~333MB) ...")
+                    log_mem("before load_explainer")
                     explainer = load_explainer()
+                    log_mem("after load_explainer")
                     print("[recs] Explainer loaded, calling Claude ...")
                     explanation = explainer.explain(int(user_id), int(top["movieId"]), float(top["relevance_score"]))
                     print("[recs] Explanation generated successfully.")
