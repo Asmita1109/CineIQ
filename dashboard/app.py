@@ -170,8 +170,7 @@ def setup_required_files():
     if not missing:
         return
 
-    with st.spinner("Setting up CineIQ..."):
-        st.write(f"Downloading {len(missing)} missing file(s) from S3 -- this only happens once...")
+    with st.spinner("Loading CineIQ..."):
         s3 = get_s3_client()
         try:
             for local_path, s3_key in S3_REQUIRED_FILES:
@@ -185,7 +184,6 @@ def setup_required_files():
             print(f"[setup] S3 download FAILED: {type(e).__name__}: {e}")
             st.error(f"Failed to download required files from S3: {type(e).__name__}: {e}")
             st.stop()
-    st.write("Setup complete.")
     print("[setup] setup_required_files() complete -- all required files present.")
     log_mem("after setup_required_files")
 
