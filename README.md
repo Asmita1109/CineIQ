@@ -152,7 +152,7 @@ The `pipeline/`, `src/forecasting/`, `src/recommender/`, and `src/rl/` directori
 - **Implicit feedback instead of explicit ratings:** switch to watch time, clicks, and completions, closer to how Netflix and Spotify actually work.
 - **Hard negative mining in BPR training:** sample negatives that are close to positives in embedding space, forcing the model to learn finer distinctions.
 - **Online RL learning:** real-time user feedback instead of offline historical data.
-- **Extended dataset coverage:** pull recent releases beyond 2023 using the TMDB API.
+- **Extended dataset coverage:** integrate a continuously updated real ratings source to capture post-2023 viewing patterns, as MovieLens ml-latest ends in July 2023.
 - **Hybrid casual-user strategy:** automatically fall back to the popularity baseline for users with fewer than 20 ratings.
 - **LLM explanation caching:** reduce API latency for production scale.
 - **Two-tower architecture:** experiment with it for faster candidate retrieval at scale.
