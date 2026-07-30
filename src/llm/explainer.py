@@ -12,10 +12,12 @@ Two data sources are used beyond the four named in this module's spec,
 because neither of those four alone can produce what the prompt needs:
   - movies_clean.csv, for movie title (movie_features.parquet has genres
     and rating stats but no title column).
-  - genome_scores_clean.csv, for each movie's raw per-tag relevance scores
-    (genome_tags_clean.csv only maps tagId -> tag name; movie_features.parquet
-    only has the 50-dim SVD-*compressed* genome embedding, which has no
-    per-tag meaning to rank "top tags" from).
+  - movie_top_tags.csv, a precomputed top-3-tags-per-movie table (see
+    build_top_tags_table.py) -- this used to be computed live from the
+    18.47M-row genome_scores_clean.csv (+ genome_tags_clean.csv for tag
+    names), which cost 500MB-1GB+ RSS to look up ~3 rows per movie per
+    request and was the leading suspect in a Streamlit Cloud OOM crash.
+    The precomputed table has the same information in 16,376 rows.
 """
 
 import os
@@ -32,7 +34,6 @@ ENV_PATH = PROJECT_ROOT / ".env"
 
 MODEL = "claude-sonnet-4-6"
 MAX_TOKENS = 250
-TOP_N_TAGS = 3
 
 RECENT_MOVIE_COLS = [f"recent_movie_{i}" for i in range(1, 6)]
 
@@ -73,8 +74,7 @@ class RecommendationExplainer:
         user_features_path=FEATURES_DIR / "user_features.parquet",
         movie_features_path=FEATURES_DIR / "movie_features.parquet",
         movies_path=PROCESSED_DIR / "movies_clean.csv",
-        genome_scores_path=PROCESSED_DIR / "genome_scores_clean.csv",
-        genome_tags_path=PROCESSED_DIR / "genome_tags_clean.csv",
+        top_tags_path=PROCESSED_DIR / "movie_top_tags.csv",
         forecasting_features_path=FEATURES_DIR / "forecasting_features.csv",
         model=MODEL,
         api_key=None,
@@ -93,16 +93,14 @@ class RecommendationExplainer:
         movie_info = movie_features.merge(movies, on="movieId", how="left")
         self.movie_info = movie_info.set_index("movieId").to_dict("index")
 
-        genome_tags = pd.read_csv(genome_tags_path)
-        self.tag_names = genome_tags.set_index("tagId")["tag"].to_dict()
-
-        # Raw per-(movie, tag) relevance -- kept indexed by movieId so a
-        # single movie's ~1,128 tag rows can be pulled out without scanning
-        # all 18M+ rows; top tags are then computed lazily per movie
-        # (memoized in _top_tags_cache) rather than precomputed for every
-        # movie in the catalog up front.
-        self.genome_scores = pd.read_csv(genome_scores_path).set_index("movieId")
-        self._top_tags_cache = {}
+        # Precomputed top-3 tags per movie (see build_top_tags_table.py) --
+        # 16,376 rows, cheap to hold in memory whole, vs. the 18.47M-row
+        # raw genome scores this used to be computed live from per request.
+        top_tags = pd.read_csv(top_tags_path)
+        self.top_tags = {
+            int(row.movieId): [t for t in (row.tag_1, row.tag_2, row.tag_3) if t and pd.notna(t)]
+            for row in top_tags.itertuples()
+        }
 
         self.trending_genre, self.trending_genre_score = self._latest_trending_genre(forecasting_features_path)
 
@@ -122,15 +120,7 @@ class RecommendationExplainer:
         return str(top_row["genre"]), float(top_row["rating_count"])
 
     def _top_tags(self, movie_id):
-        if movie_id in self._top_tags_cache:
-            return self._top_tags_cache[movie_id]
-        if movie_id not in self.genome_scores.index:
-            tags = []
-        else:
-            rows = self.genome_scores.loc[[movie_id]].nlargest(TOP_N_TAGS, "relevance")
-            tags = [self.tag_names.get(int(tag_id), f"tag {tag_id}") for tag_id in rows["tagId"]]
-        self._top_tags_cache[movie_id] = tags
-        return tags
+        return self.top_tags.get(movie_id, [])
 
     # ------------------------------------------------------------------
     # Profile builders

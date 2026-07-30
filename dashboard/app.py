@@ -68,7 +68,7 @@ log_mem("app start")
 # resolve correctly regardless of where `streamlit run` is invoked from.
 sys.path.insert(0, str(PROJECT_ROOT / "src" / "recommender"))
 sys.path.insert(0, str(PROJECT_ROOT / "src" / "llm"))
-from model import NCF, _build_user_rated_sets  # noqa: E402
+from model import NCF  # noqa: E402
 from evaluate import build_genome_lookup  # noqa: E402
 from explainer import RecommendationExplainer  # noqa: E402
 
@@ -90,7 +90,11 @@ TOP_N_RECS = 5
 S3_BUCKET = "cineiq-ml-bucket"
 S3_REGION_DEFAULT = "us-east-1"
 
-# (local path, S3 key) for files fetched as-is.
+# (local path, S3 key) for files fetched as-is. genome_scores_clean.csv
+# (18.47M rows, 333MB) and genome_tags_clean.csv are no longer needed --
+# explainer.py now uses a precomputed movie_top_tags.csv (16,376 rows,
+# built by src/llm/build_top_tags_table.py) instead of loading and
+# querying the full genome tables at runtime.
 S3_REQUIRED_FILES = [
     (FEATURES_DIR / "forecasting_features.csv", "features/forecasting_features.csv"),
     (MODELS_DIR / "forecasting_model.pkl", "models/forecasting_model.pkl"),
@@ -98,8 +102,7 @@ S3_REQUIRED_FILES = [
     (FEATURES_DIR / "movie_features.parquet", "features/movie_features.parquet"),
     (FEATURES_DIR / "rl_features.parquet", "features/rl_features.parquet"),
     (PROCESSED_DIR / "movies_clean.csv", "processed/movies_clean.csv"),
-    (PROCESSED_DIR / "genome_tags_clean.csv", "processed/genome_tags_clean.csv"),
-    (PROCESSED_DIR / "genome_scores_clean.csv", "processed/genome_scores_clean.csv"),
+    (PROCESSED_DIR / "movie_top_tags.csv", "processed/movie_top_tags.csv"),
 ]
 # The BPR model isn't stored directly -- it's inside the SageMaker training
 # job's output tarball, so it needs downloading and extracting separately.
@@ -239,18 +242,25 @@ def load_bpr_model():
     return model, ckpt, genome_lookup
 
 
-@st.cache_resource
-def load_rated_movie_sets(_user_id_map, _movie_id_map):
-    # Leading underscore tells st.cache_resource not to hash these (large,
-    # already-fixed once the BPR checkpoint is loaded) -- only the function
-    # identity matters for cache validity here, it only ever runs once.
+@st.cache_data
+def get_rated_movie_ids(user_id):
+    """Movie IDs this user has ever rated, read via a per-user parquet
+    filter instead of building a dict of frozensets for all 307K users
+    upfront (the previous approach). rl_features.parquet is sorted by
+    userId, so this filter prunes almost the entire 33.7M-row file at the
+    row-group level rather than scanning it -- measured at ~2-3MB peak
+    memory and a few hundred ms per call, cached per user_id so repeat
+    lookups for the same user in a session are free. The old approach's
+    ~500MB-1GB+ RSS (all 307K users' rated-movie sets held simultaneously,
+    for a lookup that only ever needs one user per request) was the
+    leading suspect in a Streamlit Cloud OOM crash (confirmed 503)."""
     rl_path = FEATURES_DIR / "rl_features.parquet"
-    print(f"[recs] load_rated_movie_sets: reading {rl_path} exists={rl_path.exists()} ...")
-    log_mem("before _build_user_rated_sets (33.7M-row rl_features.parquet)")
-    result = _build_user_rated_sets(rl_path, _user_id_map, _movie_id_map)
-    log_mem("after _build_user_rated_sets")
-    print("[recs] load_rated_movie_sets: done.")
-    return result
+    print(f"[recs] get_rated_movie_ids({user_id}): filtered read of {rl_path} ...")
+    df = pd.read_parquet(
+        rl_path, columns=["userId", "movieId"], filters=[("userId", "==", user_id)]
+    )
+    print(f"[recs] get_rated_movie_ids({user_id}): {len(df)} rated movies found.")
+    return frozenset(df["movieId"])
 
 
 @st.cache_resource
@@ -262,14 +272,15 @@ def load_explainer():
 # Recommender: score top-N unrated movies for a user
 # ------------------------------------------------------------------
 @torch.no_grad()
-def score_top_movies(user_id, model, ckpt, genome_lookup, rated_sets, movie_catalog, top_n=TOP_N_RECS):
+def score_top_movies(user_id, model, ckpt, genome_lookup, movie_catalog, top_n=TOP_N_RECS):
     user_id_map = ckpt["user_id_map"]
     movie_id_map = ckpt["movie_id_map"]
     if user_id not in user_id_map:
         return None
 
     user_idx = user_id_map[user_id]
-    rated = rated_sets.get(user_idx, frozenset())
+    rated_movie_ids = get_rated_movie_ids(user_id)
+    rated = frozenset(movie_id_map[mid] for mid in rated_movie_ids if mid in movie_id_map)
 
     n = len(movie_id_map)
     user_idx_t = torch.full((n,), user_idx, dtype=torch.long)
@@ -399,9 +410,9 @@ with st.expander("Diagnostics (paths + file status)", expanded=True):
     rl_path = FEATURES_DIR / "rl_features.parquet"
     rl_size = f"{rl_path.stat().st_size:,} bytes" if rl_path.exists() else "MISSING"
     st.write(f"rl_features.parquet: `{rl_path}` ({rl_size})")
-    genome_path = PROCESSED_DIR / "genome_scores_clean.csv"
-    genome_size = f"{genome_path.stat().st_size:,} bytes" if genome_path.exists() else "MISSING"
-    st.write(f"genome_scores_clean.csv: `{genome_path}` ({genome_size})")
+    tags_path = PROCESSED_DIR / "movie_top_tags.csv"
+    tags_size = f"{tags_path.stat().st_size:,} bytes" if tags_path.exists() else "MISSING"
+    st.write(f"movie_top_tags.csv: `{tags_path}` ({tags_size})")
 
 # TEMPORARY: wrap the whole loading sequence so a crash here shows the full
 # traceback on-page instead of Cloud just dying silently / showing its
@@ -418,9 +429,6 @@ try:
     print("[recs] Loading BPR model ...")
     bpr_model, bpr_ckpt, genome_lookup = load_bpr_model()
     log_mem("after load_bpr_model (cached call)")
-    print("[recs] Loading rated_movie_sets (rl_features.parquet) ...")
-    rated_sets = load_rated_movie_sets(bpr_ckpt["user_id_map"], bpr_ckpt["movie_id_map"])
-    log_mem("after load_rated_movie_sets (cached call)")
     print("[recs] All recommendation dependencies loaded successfully.")
 except Exception as e:
     import traceback
@@ -464,7 +472,7 @@ if clicked_get_recommendations or first_load:
             try:
                 print(f"[recs] score_top_movies for user {user_id} ...")
                 log_mem("before score_top_movies")
-                recs = score_top_movies(user_id, bpr_model, bpr_ckpt, genome_lookup, rated_sets, movie_catalog)
+                recs = score_top_movies(user_id, bpr_model, bpr_ckpt, genome_lookup, movie_catalog)
                 log_mem("after score_top_movies")
                 print("[recs] score_top_movies done.")
             except Exception as e:
@@ -484,7 +492,7 @@ if clicked_get_recommendations or first_load:
             explanation, explanation_error = None, None
             with st.spinner("Generating explanation..."):
                 try:
-                    print("[recs] Loading explainer (genome_scores_clean.csv, ~333MB) ...")
+                    print("[recs] Loading explainer (movie_top_tags.csv, precomputed) ...")
                     log_mem("before load_explainer")
                     explainer = load_explainer()
                     log_mem("after load_explainer")
