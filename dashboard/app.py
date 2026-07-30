@@ -346,8 +346,14 @@ st.plotly_chart(fig, width="stretch", config={"displayModeBar": False, "scrollZo
 # ------------------------------------------------------------------
 st.header("Get Personalized Recommendations")
 
-# TEMPORARY diagnostics for the Streamlit Cloud "crashes loading
+# TEMPORARY debug output for the Streamlit Cloud "crashes loading
 # recommendations, works locally" investigation -- remove once resolved.
+st.write("DEBUG: Starting recommendations")
+st.write(f"DEBUG: MODELS_DIR = {MODELS_DIR}")
+st.write(f"DEBUG: MODELS_DIR exists = {MODELS_DIR.exists()}")
+st.write(f"DEBUG: recommender_model_bpr.pt exists = {(MODELS_DIR / 'recommender_model_bpr.pt').exists()}")
+st.write(f"DEBUG: sys.path = {sys.path}")
+
 with st.expander("Diagnostics (paths + file status)", expanded=True):
     st.write(f"PROJECT_ROOT: `{PROJECT_ROOT}`")
     st.write(f"MODELS_DIR: `{MODELS_DIR}` (exists: {MODELS_DIR.exists()})")
@@ -363,15 +369,28 @@ with st.expander("Diagnostics (paths + file status)", expanded=True):
     genome_size = f"{genome_path.stat().st_size:,} bytes" if genome_path.exists() else "MISSING"
     st.write(f"genome_scores_clean.csv: `{genome_path}` ({genome_size})")
 
-print("[recs] Loading user_features.parquet ...")
-user_features = load_user_features()
-print("[recs] Loading movie_catalog (movie_features.parquet + movies_clean.csv) ...")
-movie_catalog = load_movie_catalog()
-print("[recs] Loading BPR model ...")
-bpr_model, bpr_ckpt, genome_lookup = load_bpr_model()
-print("[recs] Loading rated_movie_sets (rl_features.parquet) ...")
-rated_sets = load_rated_movie_sets(bpr_ckpt["user_id_map"], bpr_ckpt["movie_id_map"])
-print("[recs] All recommendation dependencies loaded successfully.")
+# TEMPORARY: wrap the whole loading sequence so a crash here shows the full
+# traceback on-page instead of Cloud just dying silently / showing its
+# generic error screen. st.stop() after displaying it, since letting
+# execution fall through would immediately NameError on the unassigned
+# variables below.
+try:
+    print("[recs] Loading user_features.parquet ...")
+    user_features = load_user_features()
+    print("[recs] Loading movie_catalog (movie_features.parquet + movies_clean.csv) ...")
+    movie_catalog = load_movie_catalog()
+    print("[recs] Loading BPR model ...")
+    bpr_model, bpr_ckpt, genome_lookup = load_bpr_model()
+    print("[recs] Loading rated_movie_sets (rl_features.parquet) ...")
+    rated_sets = load_rated_movie_sets(bpr_ckpt["user_id_map"], bpr_ckpt["movie_id_map"])
+    print("[recs] All recommendation dependencies loaded successfully.")
+except Exception as e:
+    import traceback
+
+    print(f"[recs] Loading dependencies FAILED: {type(e).__name__}: {e}")
+    st.error(f"Error: {e}")
+    st.code(traceback.format_exc())
+    st.stop()
 
 MIN_USER_ID = int(user_features["userId"].min())
 MAX_USER_ID = int(user_features["userId"].max())
