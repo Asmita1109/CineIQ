@@ -16,6 +16,7 @@ import tarfile
 import tempfile
 from pathlib import Path
 
+import boto3
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
@@ -73,8 +74,6 @@ BPR_MODEL_S3_KEY = "models/recommender/cineiq-recommender-20260726-053202/output
 
 
 def get_s3_client():
-    import boto3
-
     # st.secrets raises two *different* exception types depending on how
     # it's missing: StreamlitSecretNotFoundError when no secrets are
     # configured at all (e.g. .streamlit/secrets.toml doesn't exist and
