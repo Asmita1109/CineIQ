@@ -4,43 +4,13 @@ Predicts what movies and genres will trend, personalizes recommendations per use
 
 > **Core question:** How do we move from static recommendations to a self-improving content platform that predicts demand, personalizes delivery, and optimizes engagement over time?
 
-[![Live Demo](https://img.shields.io/badge/Live%20Demo-Streamlit-FF4B4B?logo=streamlit&logoColor=white)](https://cineiq-bh73b6kuriapczrbswjsuq.streamlit.app)
+**Live Demo:** [https://cineiq-bh73b6kuriapczrbswjsuq.streamlit.app](https://cineiq-bh73b6kuriapczrbswjsuq.streamlit.app)
 
 ---
 
 ## Architecture
 
-```mermaid
-flowchart TD
-    A[("MovieLens Data<br/>Ratings · Tags · Genome Scores")] --> B["Data Pipeline<br/>Ingest → Clean → Feature Engineering"]
-
-    B --> C["Trend Forecasting<br/>LightGBM"]
-    B --> D["Recommendation Engine<br/>NCF + BPR"]
-    B --> E["RL Optimization<br/>LinUCB Bandit"]
-
-    C --> F["Merge Signals"]
-    D --> F
-    E --> F
-
-    F --> G["LLM Explanation Layer<br/>Claude API"]
-    G --> H(["User"])
-
-    H -. "reward / engagement signal" .-> E
-
-    subgraph AWS["AWS Infrastructure"]
-        S3[("S3<br/>Data & Model Artifacts")]
-        SM["SageMaker<br/>NCF Training"]
-        LAM["Lambda<br/>RL Serving"]
-        APIGW["API Gateway"]
-    end
-
-    B -.-> S3
-    D -.-> SM
-    SM -.-> S3
-    E -.-> LAM
-    LAM -.-> APIGW
-    APIGW -.-> H
-```
+![CineIQ architecture: MovieLens data through the data pipeline into three parallel components (Trend Forecasting, Recommendation Engine, RL Optimization), merging into the LLM Explanation layer and out to the user, with a reward feedback loop back to the RL agent, and AWS services (S3, SageMaker, Lambda, API Gateway) supporting the pipeline.](docs/diagrams/architecture.svg)
 
 ---
 
@@ -55,39 +25,22 @@ CineIQ is an end-to-end movie intelligence platform built on the MovieLens datas
 ### 1. Trend Forecasting
 LightGBM model predicting next-week genre demand from historical rating velocity (lag + rolling-average features). **82% RMSE improvement** over a naive last-week baseline on the held-out test set.
 
-```mermaid
-flowchart LR
-    A["Weekly Genre<br/>Rating History"] --> B["LightGBM<br/>Lag + Rolling Features"]
-    B --> C["Predicted Next-Week<br/>Genre Demand"]
-```
+![Trend Forecasting flow: weekly genre rating history into LightGBM with lag and rolling features, producing predicted next-week genre demand.](docs/diagrams/forecasting.svg)
 
 ### 2. Recommendation Engine
 Neural Collaborative Filtering trained with Bayesian Personalized Ranking (BPR) pairwise loss on AWS SageMaker. **NDCG@10 = 0.80** on the held-out test set (negative-sampled ranking evaluation).
 
-```mermaid
-flowchart LR
-    A["User + Movie Embeddings<br/>+ Genome Tags"] --> B["NCF<br/>BPR Pairwise Ranking"]
-    B --> C["Top-N Ranked<br/>Movie Candidates"]
-```
+![Recommendation Engine flow: user and movie embeddings plus genome tags into an NCF model with BPR pairwise ranking, producing top-N ranked movie candidates.](docs/diagrams/recommender.svg)
 
 ### 3. RL Optimization
 A LinUCB contextual bandit that learns, per user segment, which of the recommender's top candidates to actually surface — improving **+16.8% over a most-popular baseline** on training data (generalization to unseen users narrows this gap, see [Key Results](#key-results)).
 
-```mermaid
-flowchart LR
-    A["NCF Candidates +<br/>User Context"] --> B["LinUCB<br/>Contextual Bandit"]
-    B --> C["Selected<br/>Recommendation"]
-    C -. "reward" .-> B
-```
+![RL Optimization flow: NCF candidates and user context into a LinUCB contextual bandit, producing a selected recommendation, with a reward signal feeding back into the bandit.](docs/diagrams/rl.svg)
 
 ### 4. LLM Explanation
 Claude API generates a short, personalized explanation for each recommendation, grounded in the user's taste profile, the movie's tag/genre profile, and the current genre trend signal.
 
-```mermaid
-flowchart LR
-    A["Recommendation +<br/>Taste Profile + Trend"] --> B["Claude API"]
-    B --> C["Personalized<br/>Explanation Text"]
-```
+![LLM Explanation flow: recommendation, taste profile, and trend signal into the Claude API, producing a personalized explanation.](docs/diagrams/llm.svg)
 
 ---
 

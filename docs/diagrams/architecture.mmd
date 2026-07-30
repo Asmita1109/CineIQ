@@ -1,0 +1,29 @@
+flowchart TD
+    A[("MovieLens Data<br/>Ratings · Tags · Genome Scores")] --> B["Data Pipeline<br/>Ingest → Clean → Feature Engineering"]
+
+    B --> C["Trend Forecasting<br/>LightGBM"]
+    B --> D["Recommendation Engine<br/>NCF + BPR"]
+    B --> E["RL Optimization<br/>LinUCB Bandit"]
+
+    C --> F["Merge Signals"]
+    D --> F
+    E --> F
+
+    F --> G["LLM Explanation Layer<br/>Claude API"]
+    G --> H(["User"])
+
+    H -. "reward / engagement signal" .-> E
+
+    subgraph AWS["AWS Infrastructure"]
+        S3[("S3<br/>Data & Model Artifacts")]
+        SM["SageMaker<br/>NCF Training"]
+        LAM["Lambda<br/>RL Serving"]
+        APIGW["API Gateway"]
+    end
+
+    B -.-> S3
+    D -.-> SM
+    SM -.-> S3
+    E -.-> LAM
+    LAM -.-> APIGW
+    APIGW -.-> H
