@@ -29,6 +29,14 @@ FEATURES_DIR = DATA_DIR / "features"
 PROCESSED_DIR = DATA_DIR / "processed"
 MODELS_DIR = PROJECT_ROOT / "models"
 
+# TEMPORARY diagnostics for the Streamlit Cloud "crashes loading
+# recommendations, works locally" investigation -- remove once resolved.
+print(f"[paths] __file__={__file__}")
+print(f"[paths] PROJECT_ROOT={PROJECT_ROOT}")
+print(f"[paths] FEATURES_DIR={FEATURES_DIR}")
+print(f"[paths] PROCESSED_DIR={PROCESSED_DIR}")
+print(f"[paths] MODELS_DIR={MODELS_DIR}")
+
 # dashboard/ is a sibling of src/ -- add the specific package dirs we need
 # so bare imports (matching those modules' own same-directory convention)
 # resolve correctly regardless of where `streamlit run` is invoked from.
@@ -181,7 +189,10 @@ def load_movie_catalog():
 
 @st.cache_resource
 def load_bpr_model():
-    ckpt = torch.load(MODELS_DIR / "recommender_model_bpr.pt", map_location="cpu", weights_only=False)
+    ckpt_path = MODELS_DIR / "recommender_model_bpr.pt"
+    print(f"[recs] load_bpr_model: torch.load({ckpt_path}) exists={ckpt_path.exists()} ...")
+    ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+    print("[recs] load_bpr_model: checkpoint loaded, building NCF model ...")
     model = NCF(
         num_users=ckpt["num_users"],
         num_movies=ckpt["num_movies"],
@@ -194,6 +205,7 @@ def load_bpr_model():
     model.eval()
     movie_features = pd.read_parquet(FEATURES_DIR / "movie_features.parquet")
     genome_lookup = build_genome_lookup(movie_features, ckpt["movie_id_map"], ckpt["genome_dim"])
+    print("[recs] load_bpr_model: done.")
     return model, ckpt, genome_lookup
 
 
@@ -202,7 +214,11 @@ def load_rated_movie_sets(_user_id_map, _movie_id_map):
     # Leading underscore tells st.cache_resource not to hash these (large,
     # already-fixed once the BPR checkpoint is loaded) -- only the function
     # identity matters for cache validity here, it only ever runs once.
-    return _build_user_rated_sets(FEATURES_DIR / "rl_features.parquet", _user_id_map, _movie_id_map)
+    rl_path = FEATURES_DIR / "rl_features.parquet"
+    print(f"[recs] load_rated_movie_sets: reading {rl_path} exists={rl_path.exists()} ...")
+    result = _build_user_rated_sets(rl_path, _user_id_map, _movie_id_map)
+    print("[recs] load_rated_movie_sets: done.")
+    return result
 
 
 @st.cache_resource
@@ -330,10 +346,32 @@ st.plotly_chart(fig, width="stretch", config={"displayModeBar": False, "scrollZo
 # ------------------------------------------------------------------
 st.header("Get Personalized Recommendations")
 
+# TEMPORARY diagnostics for the Streamlit Cloud "crashes loading
+# recommendations, works locally" investigation -- remove once resolved.
+with st.expander("Diagnostics (paths + file status)", expanded=True):
+    st.write(f"PROJECT_ROOT: `{PROJECT_ROOT}`")
+    st.write(f"MODELS_DIR: `{MODELS_DIR}` (exists: {MODELS_DIR.exists()})")
+    st.write(f"FEATURES_DIR: `{FEATURES_DIR}` (exists: {FEATURES_DIR.exists()})")
+    st.write(f"PROCESSED_DIR: `{PROCESSED_DIR}` (exists: {PROCESSED_DIR.exists()})")
+    bpr_path = MODELS_DIR / "recommender_model_bpr.pt"
+    bpr_size = f"{bpr_path.stat().st_size:,} bytes" if bpr_path.exists() else "MISSING"
+    st.write(f"BPR checkpoint: `{bpr_path}` ({bpr_size})")
+    rl_path = FEATURES_DIR / "rl_features.parquet"
+    rl_size = f"{rl_path.stat().st_size:,} bytes" if rl_path.exists() else "MISSING"
+    st.write(f"rl_features.parquet: `{rl_path}` ({rl_size})")
+    genome_path = PROCESSED_DIR / "genome_scores_clean.csv"
+    genome_size = f"{genome_path.stat().st_size:,} bytes" if genome_path.exists() else "MISSING"
+    st.write(f"genome_scores_clean.csv: `{genome_path}` ({genome_size})")
+
+print("[recs] Loading user_features.parquet ...")
 user_features = load_user_features()
+print("[recs] Loading movie_catalog (movie_features.parquet + movies_clean.csv) ...")
 movie_catalog = load_movie_catalog()
+print("[recs] Loading BPR model ...")
 bpr_model, bpr_ckpt, genome_lookup = load_bpr_model()
+print("[recs] Loading rated_movie_sets (rl_features.parquet) ...")
 rated_sets = load_rated_movie_sets(bpr_ckpt["user_id_map"], bpr_ckpt["movie_id_map"])
+print("[recs] All recommendation dependencies loaded successfully.")
 
 MIN_USER_ID = int(user_features["userId"].min())
 MAX_USER_ID = int(user_features["userId"].max())
@@ -377,9 +415,13 @@ if clicked_get_recommendations or first_load:
             explanation, explanation_error = None, None
             with st.spinner("Generating explanation..."):
                 try:
+                    print("[recs] Loading explainer (genome_scores_clean.csv, ~333MB) ...")
                     explainer = load_explainer()
+                    print("[recs] Explainer loaded, calling Claude ...")
                     explanation = explainer.explain(int(user_id), int(top["movieId"]), float(top["relevance_score"]))
+                    print("[recs] Explanation generated successfully.")
                 except Exception as e:
+                    print(f"[recs] Explanation FAILED: {type(e).__name__}: {e}")
                     explanation_error = str(e)
 
             st.session_state.rec_result = {
