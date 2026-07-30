@@ -5,3 +5,4 @@ pyarrow
 torch
 plotly
 anthropic
+boto3

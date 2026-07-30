@@ -10,7 +10,10 @@ Two sections:
 Run with: streamlit run dashboard/app.py
 """
 
+import shutil
 import sys
+import tarfile
+import tempfile
 from pathlib import Path
 
 import numpy as np
@@ -43,7 +46,115 @@ CORE_QUESTION = (
 TOP_N_GENRES = 5
 TOP_N_RECS = 5
 
+# ------------------------------------------------------------------
+# First-run setup: download required data/model files from S3 if they
+# aren't already present locally. Lets the app run on a fresh deploy
+# (e.g. Streamlit Community Cloud) where only the code is checked out, not
+# the ~900MB of data/model artifacts a full local dev checkout would have.
+# ------------------------------------------------------------------
+S3_BUCKET = "cineiq-ml-bucket"
+S3_REGION_DEFAULT = "us-east-1"
+
+# (local path, S3 key) for files fetched as-is.
+S3_REQUIRED_FILES = [
+    (FEATURES_DIR / "forecasting_features.csv", "features/forecasting_features.csv"),
+    (MODELS_DIR / "forecasting_model.pkl", "models/forecasting_model.pkl"),
+    (FEATURES_DIR / "user_features.parquet", "features/user_features.parquet"),
+    (FEATURES_DIR / "movie_features.parquet", "features/movie_features.parquet"),
+    (FEATURES_DIR / "rl_features.parquet", "features/rl_features.parquet"),
+    (PROCESSED_DIR / "movies_clean.csv", "processed/movies_clean.csv"),
+    (PROCESSED_DIR / "genome_tags_clean.csv", "processed/genome_tags_clean.csv"),
+    (PROCESSED_DIR / "genome_scores_clean.csv", "processed/genome_scores_clean.csv"),
+]
+# The BPR model isn't stored directly -- it's inside the SageMaker training
+# job's output tarball, so it needs downloading and extracting separately.
+BPR_MODEL_TARGET = MODELS_DIR / "recommender_model_bpr.pt"
+BPR_MODEL_S3_KEY = "models/recommender/cineiq-recommender-20260726-053202/output/model.tar.gz"
+
+
+def get_s3_client():
+    import boto3
+
+    # st.secrets raises two *different* exception types depending on how
+    # it's missing: StreamlitSecretNotFoundError when no secrets are
+    # configured at all (e.g. .streamlit/secrets.toml doesn't exist and
+    # nothing's set in the Cloud app's Secrets panel), KeyError when
+    # secrets exist but a specific key is absent/misspelled. Verified both
+    # directly -- catching only KeyError (the original bug) let the first
+    # case escape as an unhandled traceback instead of the friendly error.
+    try:
+        return boto3.client(
+            "s3",
+            region_name=st.secrets.get("AWS_DEFAULT_REGION", S3_REGION_DEFAULT),
+            aws_access_key_id=st.secrets["AWS_ACCESS_KEY_ID"],
+            aws_secret_access_key=st.secrets["AWS_SECRET_ACCESS_KEY"],
+        )
+    except (KeyError, FileNotFoundError, st.errors.StreamlitSecretNotFoundError):
+        st.error(
+            "Required files are missing and no AWS credentials were found in Streamlit "
+            "secrets (AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY / AWS_DEFAULT_REGION). "
+            "On Streamlit Community Cloud, add them under your app's Settings -> Secrets. "
+            "For local dev, add them to .streamlit/secrets.toml."
+        )
+        st.stop()
+
+
+def _download_bpr_model(s3):
+    if BPR_MODEL_TARGET.exists():
+        return
+    print(f"[setup] Downloading + extracting BPR model from s3://{S3_BUCKET}/{BPR_MODEL_S3_KEY} ...")
+    BPR_MODEL_TARGET.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        tar_path = Path(tmp_dir) / "model.tar.gz"
+        s3.download_file(S3_BUCKET, BPR_MODEL_S3_KEY, str(tar_path))
+        with tarfile.open(tar_path) as tar:
+            tar.extractall(tmp_dir)
+        shutil.move(str(Path(tmp_dir) / "recommender_model.pt"), str(BPR_MODEL_TARGET))
+    print(f"[setup] BPR model ready at {BPR_MODEL_TARGET} ({BPR_MODEL_TARGET.stat().st_size:,} bytes)")
+
+
+def setup_required_files():
+    """No-ops (and never touches S3 or secrets) if everything's already
+    present -- always true for local dev once the training pipeline has
+    generated these files.
+
+    Deliberately NOT @st.cache_resource-wrapped: the function's own
+    Path.exists() checks are already near-free (9 stat calls), so caching
+    saved nothing meaningful, while it added a real failure mode -- if
+    something inside ever raised in a way the cache layer didn't expect
+    (e.g. st.stop()'s internal control-flow exception), a broken/partial
+    run could plausibly get treated as a completed one and never retried
+    on the next script run. Calling this as a plain function every rerun
+    is simpler to reason about and costs nothing once files exist.
+    """
+    missing = [p for p, _ in S3_REQUIRED_FILES if not p.exists()] + (
+        [] if BPR_MODEL_TARGET.exists() else [BPR_MODEL_TARGET]
+    )
+    print(f"[setup] setup_required_files() running. Missing: {[str(p) for p in missing] or 'none'}")
+    if not missing:
+        return
+
+    with st.spinner("Setting up CineIQ..."):
+        st.write(f"Downloading {len(missing)} missing file(s) from S3 -- this only happens once...")
+        s3 = get_s3_client()
+        try:
+            for local_path, s3_key in S3_REQUIRED_FILES:
+                if not local_path.exists():
+                    print(f"[setup] Downloading s3://{S3_BUCKET}/{s3_key} -> {local_path}")
+                    local_path.parent.mkdir(parents=True, exist_ok=True)
+                    s3.download_file(S3_BUCKET, s3_key, str(local_path))
+                    print(f"[setup] Done: {local_path} ({local_path.stat().st_size:,} bytes)")
+            _download_bpr_model(s3)
+        except Exception as e:
+            print(f"[setup] S3 download FAILED: {type(e).__name__}: {e}")
+            st.error(f"Failed to download required files from S3: {type(e).__name__}: {e}")
+            st.stop()
+    st.write("Setup complete.")
+    print("[setup] setup_required_files() complete -- all required files present.")
+
+
 st.set_page_config(page_title="CineIQ", page_icon="\U0001f3ac", layout="wide")
+setup_required_files()
 
 
 # ------------------------------------------------------------------

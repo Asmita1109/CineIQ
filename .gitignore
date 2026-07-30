@@ -21,6 +21,7 @@ env/
 # Environment variables / secrets
 .env
 *.env
+.streamlit/secrets.toml
 
 # Data
 data/*
