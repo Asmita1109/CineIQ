@@ -8,7 +8,7 @@ Predicts what movies and genres will trend, personalizes recommendations per use
 
 ## Architecture
 
-<img src="docs/diagrams/architecture.svg" alt="CineIQ architecture: MovieLens data through the data pipeline into three parallel components (Trend Forecasting, Recommendation Engine, RL Optimization), merging into the LLM Explanation layer and out to the user, with a reward feedback loop back to the RL agent, and AWS services (S3, SageMaker, Lambda, API Gateway) supporting the pipeline." width="500">
+<img src="docs/diagrams/architecture.svg" alt="CineIQ architecture: MovieLens data through the data pipeline into three parallel components (Trend Forecasting, Recommendation Engine, RL Optimization), merging into the LLM Explanation layer and out to the user, with a reward feedback loop back to the RL agent, and AWS services (S3, SageMaker) supporting the pipeline." width="500">
 
 ## Overview
 
