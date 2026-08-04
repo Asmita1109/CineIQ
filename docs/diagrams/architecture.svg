@@ -1,22 +1,20 @@
- Mermaid diagram - S3 and SageMaker in the AWS Infrastructure box:
-
 ```mermaid
 flowchart TD
     A[(MovieLens 33.8M ratings)] --> B[Data Pipeline]
-    B --> C[Trend Forecasting\nLightGBM]
-    B --> D[Recommendation Engine\nNCF + BPR]
-    B --> E[RL Optimization\nLinUCB Bandit]
+    B --> C[Trend Forecasting LightGBM]
+    B --> D[Recommendation Engine NCF BPR]
+    B --> E[RL Optimization LinUCB Bandit]
     C --> F[Merge Signals]
     D --> F
     E --> F
-    F --> G[LLM Explanation Layer\nClaude API]
+    F --> G[LLM Explanation Layer Claude API]
     G --> H((User))
     H --> I[reward / engagement signal]
     I --> E
 
-    subgraph AWS Infrastructure
-        J[SageMaker\nNCF Training]
-        K[(S3\nData & Model Artifacts)]
+    subgraph AWS [AWS Infrastructure]
+        J[SageMaker NCF Training]
+        K[(S3 Data and Model Artifacts)]
     end
 
     D -.-> J
@@ -25,4 +23,4 @@ flowchart TD
     E -.-> K
 ```
 
-Click the pencil icon on the README, find the existing Mermaid block, replace it entirely with this. Then commit.
+Copy this into your README replacing the broken diagram. Then commit.
