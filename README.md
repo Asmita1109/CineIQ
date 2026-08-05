@@ -151,7 +151,7 @@ The `pipeline/`, `src/forecasting/`, `src/recommender/`, and `src/rl/` directori
 
 - **Implicit feedback instead of explicit ratings:** switch to watch time, clicks, and completions, closer to how Netflix and Spotify actually work.
 - **Hard negative mining in BPR training:** sample negatives that are close to positives in embedding space, forcing the model to learn finer distinctions.
-- **Online RL learning:** collect real user feedback from the Streamlit dashboard, pipe it back to update the LinUCB weights continuously, and persist the updated policy to S3, making the RL component ga self-improving rather than a frozen offline policy.
+- **Online RL learning:** collect real user feedback from the Streamlit dashboard, pipe it back to update the LinUCB weights continuously, and persist the updated policy to S3, making the RL component self-improving rather than a frozen offline policy.
 - **Extended dataset coverage:** integrate a continuously updated real ratings source to capture post-2023 viewing patterns, as MovieLens ml-latest ends in July 2023.
 - **Hybrid casual-user strategy:** automatically fall back to the popularity baseline for users with fewer than 20 ratings.
 - **LLM explanation caching:** reduce API latency for production scale.
