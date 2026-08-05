@@ -1,4 +1,4 @@
-# CineIQ: A Self-Improving Movie Intelligence Platform
+# CineIQ: Beyond Static Recommendation
 
 Predicts what movies and genres will trend, personalizes recommendations per user, and continuously improves engagement through reinforcement learning and LLM-generated explanations, all built on the MovieLens dataset.
 
