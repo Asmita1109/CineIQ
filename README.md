@@ -142,7 +142,7 @@ The `pipeline/`, `src/forecasting/`, `src/recommender/`, and `src/rl/` directori
 
 - **Dataset ends July 2023:** recent viewing patterns and new releases aren't captured.
 - **Explicit ratings are rare in production:** most real platforms rely on implicit feedback (clicks, watch time, skips), not 5-star ratings.
-- **The RL agent is trained on offline historical data:** online learning with real-time feedback would likely improve results further than what offline replay can show.
+- **The RL agent serves a frozen trained policy in the current deployment:** without real user feedback flowing back at inference time, the agent does not adapt or improve after training. Online learning requires a feedback collection pipeline that does not yet exist.
 - **Casual users are better served by the popularity baseline due to cold start:** the bandit has too little interaction history to personalize effectively for low-activity users.
 - **The LLM explanation layer adds latency:** a production deployment at scale would need caching (already partially addressed) and/or async generation.
 - **Model accuracy is limited by CPU training and dataset size:** GPU training and the full MovieLens 25M+ dataset would likely improve all three model components.
@@ -151,7 +151,7 @@ The `pipeline/`, `src/forecasting/`, `src/recommender/`, and `src/rl/` directori
 
 - **Implicit feedback instead of explicit ratings:** switch to watch time, clicks, and completions, closer to how Netflix and Spotify actually work.
 - **Hard negative mining in BPR training:** sample negatives that are close to positives in embedding space, forcing the model to learn finer distinctions.
-- **Online RL learning:** real-time user feedback instead of offline historical data.
+- **Online RL learning:** collect real user feedback from the Streamlit dashboard, pipe it back to update the LinUCB weights continuously, and persist the updated policy to S3 -- making the RL component genuinely self-improving rather than a frozen offline policy.
 - **Extended dataset coverage:** integrate a continuously updated real ratings source to capture post-2023 viewing patterns, as MovieLens ml-latest ends in July 2023.
 - **Hybrid casual-user strategy:** automatically fall back to the popularity baseline for users with fewer than 20 ratings.
 - **LLM explanation caching:** reduce API latency for production scale.
