@@ -1,3 +1,4 @@
+%%{init: {'flowchart': {'htmlLabels': false}}}%%
 flowchart TD
     A[("MovieLens Data<br/>Ratings · Tags · Genome Scores")] --> B["Data Pipeline<br/>Ingest → Clean → Feature Engineering"]
 
@@ -15,15 +16,10 @@ flowchart TD
     H -. "reward / engagement signal" .-> E
 
     subgraph AWS["AWS Infrastructure"]
-        S3[("S3<br/>Data & Model Artifacts")]
+        S3[("S3<br/>Data and Model Artifacts")]
         SM["SageMaker<br/>NCF Training"]
-        LAM["Lambda<br/>RL Serving"]
-        APIGW["API Gateway"]
     end
 
     B -.-> S3
     D -.-> SM
     SM -.-> S3
-    E -.-> LAM
-    LAM -.-> APIGW
-    APIGW -.-> H
